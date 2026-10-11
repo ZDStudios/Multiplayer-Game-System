@@ -1,0 +1,6 @@
+# Automatic HTTPS (Let's Encrypt). DOMAIN comes from .env.
+# No domain? Use <your-vps-ip-with-dashes>.sslip.io, e.g. 187-77-1-23.sslip.io
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy mp:8080
+}

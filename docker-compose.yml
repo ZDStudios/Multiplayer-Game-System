@@ -1,0 +1,29 @@
+services:
+  mp:
+    build: { context: ., dockerfile: server/Dockerfile }
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TRUST_PROXY: "true"
+    volumes:
+      - mp-data:/data
+    expose: ["8080"]
+    # Uncomment to also expose directly (e.g. no domain yet / own reverse proxy):
+    # ports: ["8080:8080"]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [mp]
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  mp-data:
+  caddy-data:
+  caddy-config:

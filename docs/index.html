@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multiplayer Control</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='10' cy='16' r='6' fill='%2338bdf8'/><circle cx='22' cy='16' r='6' fill='%23a78bfa'/></svg>">
+<style>
+:root{--bg:#0b0d12;--panel:#12151c;--panel2:#171b24;--line:#232836;--text:#e6e8ee;--mute:#8b93a7;--acc:#38bdf8;--acc2:#a78bfa;--ok:#34d399;--warn:#fbbf24;--bad:#f87171;--r:10px;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+@media (prefers-color-scheme: light){:root:not([data-theme="dark"]){--bg:#f5f6f8;--panel:#fff;--panel2:#f0f2f5;--line:#e2e5eb;--text:#151821;--mute:#5d6577;--acc:#0284c7;--acc2:#7c3aed}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+button,input,select,textarea{font:inherit;color:inherit}
+button{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer}
+button:hover{border-color:var(--acc)}
+button.primary{background:var(--acc);border-color:var(--acc);color:#04121c;font-weight:600}
+button.danger{color:var(--bad)}button.danger:hover{border-color:var(--bad)}
+button.sm{padding:3px 8px;font-size:12px}
+input,select,textarea{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 10px;width:100%}
+input:focus,textarea:focus{outline:none;border-color:var(--acc)}
+.mono{font-family:var(--mono);font-size:12.5px}
+.mute{color:var(--mute)}
+.wrap{max-width:1280px;margin:0 auto;padding:16px}
+header{display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(8px);z-index:5}
+header h1{font-size:16px;margin:0;display:flex;align-items:center;gap:8px}
+.logo{width:22px;height:14px;position:relative}.logo:before,.logo:after{content:"";position:absolute;top:0;width:14px;height:14px;border-radius:50%;background:var(--acc)}.logo:after{left:8px;background:var(--acc2);mix-blend-mode:screen}
+.sp{flex:1}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:var(--mute)}.dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}.dot.off{background:var(--bad)}
+.grid{display:grid;gap:12px}
+.cards{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:14px}
+.card .k{color:var(--mute);font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+.card .v{font-size:26px;font-weight:650;margin-top:4px;font-variant-numeric:tabular-nums}
+.card .s{color:var(--mute);font-size:12px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+.panel>h2{font-size:13px;margin:0;padding:12px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;text-transform:uppercase;letter-spacing:.04em;color:var(--mute)}
+.panel>.body{padding:14px}
+.two{grid-template-columns:2fr 1fr}
+@media (max-width:900px){.two{grid-template-columns:1fr}}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:9px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{font-size:12px;color:var(--mute);font-weight:500}
+tbody tr.click{cursor:pointer}tbody tr.click:hover{background:var(--panel2)}
+.tablewrap{overflow-x:auto}
+.feed{max-height:282px;overflow:auto;font-size:13px}
+.feed div{padding:7px 14px;border-bottom:1px solid var(--line);display:flex;gap:8px}
+.tag{font-size:11px;padding:1px 7px;border-radius:99px;background:var(--panel2);border:1px solid var(--line);color:var(--mute)}
+.tag.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 40%,transparent)}.tag.bad{color:var(--bad)}.tag.acc{color:var(--acc)}
+canvas{width:100%;height:240px;display:block}
+.login{max-width:420px;margin:12vh auto;padding:0 16px}
+.login .card{padding:24px}.login label{display:block;margin:14px 0 6px;color:var(--mute);font-size:12px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.kv{display:grid;grid-template-columns:140px 1fr;gap:8px 12px;align-items:center}
+.secret{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 10px;overflow:auto;white-space:nowrap}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;max-height:260px;overflow:auto;margin:8px 0 0;font:12px/1.4 var(--mono);white-space:pre-wrap;word-break:break-all}
+.room{border:1px solid var(--line);border-radius:8px;margin-bottom:10px}
+.room summary{padding:10px 12px;cursor:pointer;display:flex;gap:10px;align-items:center;list-style:none}
+.room summary::-webkit-details-marker{display:none}
+.room .inner{padding:0 12px 12px}
+.back{margin-bottom:12px}
+.empty{padding:22px;text-align:center;color:var(--mute)}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);padding:9px 16px;border-radius:8px;opacity:0;transition:.2s;pointer-events:none;z-index:20}
+.toast.show{opacity:1}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);padding:0 10px}
+.tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;background:none;padding:10px 12px;color:var(--mute)}
+.tabs button.on{color:var(--text);border-bottom-color:var(--acc)}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+<div id="login" class="login hidden">
+  <div class="card">
+    <h1 style="margin:0 0 4px;font-size:20px;display:flex;gap:10px;align-items:center"><span class="logo"></span> Multiplayer Control</h1>
+    <div class="mute">Connect to your multiplayer server.</div>
+    <form id="loginForm">
+      <label>Server URL</label><input id="lUrl" placeholder="https://mp.example.com" required>
+      <label>Admin token</label><input id="lTok" type="password" placeholder="ADMIN_TOKEN from your .env" required>
+      <div id="lErr" class="mute" style="color:var(--bad);min-height:20px;margin-top:10px"></div>
+      <button class="primary" style="width:100%;margin-top:6px">Connect</button>
+    </form>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <h1><span class="logo"></span> Multiplayer Control</h1>
+    <span class="dot" id="hDot"></span><span class="mute mono" id="hUrl"></span>
+    <span class="sp"></span>
+    <span class="mute" id="hUp"></span>
+    <button class="sm" id="logout">Disconnect</button>
+  </header>
+  <div class="wrap">
+    <div id="overview">
+      <div class="grid cards" id="cards"></div>
+      <div class="grid two" style="margin-top:12px">
+        <div class="panel"><h2>Traffic · last 3 min <span class="sp"></span><span class="tag acc">players</span><span class="tag" style="color:var(--acc2)">msgs/s</span></h2><div class="body"><canvas id="chart"></canvas></div></div>
+        <div class="panel"><h2>Activity</h2><div class="feed" id="feed"></div></div>
+      </div>
+      <div class="panel" style="margin-top:12px">
+        <h2>Games <span class="sp"></span><button class="sm primary" id="newGame">+ New game</button></h2>
+        <div class="tablewrap"><table><thead><tr><th></th><th>Game</th><th>Online</th><th>Rooms</th><th>Msgs/s</th><th>Peak</th><th>All-time players</th><th>Last active</th></tr></thead><tbody id="games"></tbody></table></div>
+      </div>
+    </div>
+    <div id="detail" class="hidden"></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (s, el = document) => el.querySelector(s);
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmtDur = (ms) => { const s = Math.floor(ms / 1000), d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`; };
+const ago = (t) => !t ? '—' : Date.now() - t < 5000 ? 'now' : fmtDur(Date.now() - t) + ' ago';
+const bytes = (n) => n > 1e9 ? (n / 1e9).toFixed(1) + ' GB' : n > 1e6 ? (n / 1e6).toFixed(1) + ' MB' : (n / 1e3).toFixed(0) + ' KB';
+const pretty = (j) => { try { return JSON.stringify(JSON.parse(j), null, 2); } catch { return j; } };
+const num = (n) => Number(n || 0).toLocaleString();
+const toast = (m) => { const t = $('#toast'); t.textContent = m; t.classList.add('show'); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('show'), 1800); };
+const copy = (s) => navigator.clipboard.writeText(s).then(() => toast('Copied'));
+const LS = { get: (k) => { try { return localStorage.getItem(k); } catch { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch {} }, del: (k) => { try { localStorage.removeItem(k); } catch {} } };
+
+let SERVER = LS.get('mp_server') || '', TOKEN = LS.get('mp_admin') || '';
+let current = null, timer = null, lastOverview = null, detailTab = 'rooms';
+const qs = new URLSearchParams(location.search);
+if (qs.get('server')) SERVER = qs.get('server');
+if (!SERVER && /^https?:$/.test(location.protocol) && !location.hostname.endsWith('github.io')) SERVER = location.origin;
+
+async function api(method, path, body) {
+  const r = await fetch(SERVER.replace(/\/+$/, '') + '/api/admin' + path, {
+    method, headers: { authorization: 'Bearer ' + TOKEN, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const data = await r.json().catch(() => ({}));
+  if (r.status === 401) { logout(); throw new Error('Unauthorized'); }
+  if (!r.ok) throw new Error(data.message || data.error || r.statusText);
+  return data;
+}
+
+function showLogin(err) {
+  $('#app').classList.add('hidden'); $('#login').classList.remove('hidden');
+  $('#lUrl').value = SERVER; $('#lErr').textContent = err || '';
+}
+function logout() { LS.del('mp_admin'); TOKEN = ''; clearInterval(timer); showLogin(); }
+$('#logout').onclick = logout;
+$('#loginForm').onsubmit = async (e) => {
+  e.preventDefault();
+  SERVER = $('#lUrl').value.trim().replace(/\/+$/, ''); TOKEN = $('#lTok').value.trim();
+  try { await api('GET', '/overview'); LS.set('mp_server', SERVER); LS.set('mp_admin', TOKEN); start(); }
+  catch (err) { $('#lErr').textContent = err.message === 'Failed to fetch' ? 'Could not reach server (check URL / HTTPS)' : err.message; }
+};
+
+function start() {
+  $('#login').classList.add('hidden'); $('#app').classList.remove('hidden');
+  $('#hUrl').textContent = SERVER.replace(/^https?:\/\//, '');
+  clearInterval(timer); tick(); timer = setInterval(tick, 2000);
+}
+let paused = false;
+async function tick(force) {
+  if (current && paused && force !== true) return;
+  try {
+    if (current) await renderDetail(); else renderOverview(await api('GET', '/overview'));
+    $('#hDot').className = 'dot on';
+  } catch (e) { $('#hDot').className = 'dot off'; }
+}
+
+function renderOverview(o) {
+  lastOverview = o;
+  const s = o.server, h = o.history, last = h[h.length - 1] || { in: 0, out: 0 };
+  $('#hUp').textContent = 'up ' + fmtDur(s.uptime);
+  const card = (k, v, sub) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${sub || '&nbsp;'}</div></div>`;
+  $('#cards').innerHTML = [
+    card('Players online', num(s.online), `${num(s.connections)} sockets`),
+    card('Active rooms', num(s.rooms)),
+    card('Games', num(o.games.length), `${o.games.filter((g) => g.online).length} live now`),
+    card('Msgs / sec', `${num(last.in)}<span class="mute" style="font-size:15px"> in</span>`, `${num(last.out)} out`),
+    card('Traffic', bytes(s.bytesIn + s.bytesOut), `${bytes(s.bytesIn)} in · ${bytes(s.bytesOut)} out`),
+    card('Memory', bytes(s.rss), `Node ${esc(s.node)}`),
+  ].join('');
+  drawChart(h);
+  $('#feed').innerHTML = o.events.map((e) => {
+    const g = o.games.find((x) => x.id === e.game);
+    return `<div><span class="mute mono">${new Date(e.ts).toLocaleTimeString()}</span><span class="tag">${esc(e.type)}</span><span>${g ? `<b>${esc(g.name)}</b> · ` : ''}${esc(e.text)}</span></div>`;
+  }).join('') || '<div class="empty">No activity yet</div>';
+  $('#games').innerHTML = o.games.map((g) => `<tr class="click" data-id="${esc(g.id)}">
+    <td><span class="dot ${!g.enabled ? 'off' : g.online ? 'on' : ''}"></span></td>
+    <td><b>${esc(g.name)}</b> <span class="mute mono">${esc(g.id)}</span>${g.enabled ? '' : ' <span class="tag bad">disabled</span>'}</td>
+    <td>${num(g.online)}</td><td>${num(g.rooms)}</td><td>${num(g.msgRate)}</td><td>${num(g.peak)}</td><td>${num(g.totalPlayers)}</td><td class="mute">${ago(g.lastActive)}</td></tr>`).join('')
+    || `<tr><td colspan="8" class="empty">No games yet — create one to get a key.</td></tr>`;
+  document.querySelectorAll('#games tr.click').forEach((tr) => tr.onclick = () => openGame(tr.dataset.id));
+}
+
+function drawChart(h) {
+  const cv = $('#chart'), dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const x = cv.getContext('2d'); x.scale(dpr, dpr); x.clearRect(0, 0, W, H);
+  const cs = getComputedStyle(document.documentElement);
+  const line = (vals, color) => {
+    const max = Math.max(1, ...vals) * 1.15, n = 180;
+    x.beginPath();
+    vals.forEach((v, i) => { const px = W - (vals.length - 1 - i) * (W / (n - 1)), py = H - 4 - (v / max) * (H - 12); i ? x.lineTo(px, py) : x.moveTo(px, py); });
+    x.strokeStyle = color; x.lineWidth = 2; x.stroke();
+    x.lineTo(W, H); x.lineTo(W - (vals.length - 1) * (W / (n - 1)), H); x.closePath();
+    x.globalAlpha = .08; x.fillStyle = color; x.fill(); x.globalAlpha = 1;
+    x.fillStyle = color; x.font = '11px system-ui'; x.fillText('max ' + Math.round(max / 1.15), 4, color === cs.getPropertyValue('--acc') ? 12 : 26);
+  };
+  x.strokeStyle = cs.getPropertyValue('--line'); x.lineWidth = 1;
+  for (let i = 1; i < 4; i++) { x.beginPath(); x.moveTo(0, H * i / 4); x.lineTo(W, H * i / 4); x.stroke(); }
+  if (h.length > 1) { line(h.map((p) => p.in), cs.getPropertyValue('--acc2')); line(h.map((p) => p.players), cs.getPropertyValue('--acc')); }
+}
+
+$('#newGame').onclick = async () => {
+  const name = prompt('Game name?'); if (!name) return;
+  const g = await api('POST', '/games', { name }); toast('Game created'); openGame(g.id);
+};
+
+// ---------- game detail ----------
+function openGame(id) { current = id; detailTab = 'rooms'; paused = false; $('#overview').classList.add('hidden'); $('#detail').classList.remove('hidden'); $('#detail').innerHTML = '<div class="empty">Loading…</div>'; tick(); }
+function closeGame() { current = null; $('#detail').classList.add('hidden'); $('#overview').classList.remove('hidden'); tick(); }
+
+function claudePrompt(g) {
+  return `Add online multiplayer to this game using my multiplayer server.
+Server URL: ${SERVER}
+Game key: ${g.key}
+SDK: <script src="${SERVER}/sdk.js"><\/script>  (global \`Multiplayer\`)
+Full integration guide: ${SERVER}/MULTIPLAYER.md — fetch and follow it (or use the MULTIPLAYER.md I attached).`;
+}
+
+let openRooms = new Set(), kvCache = null;
+async function renderDetail() {
+  const g = await api('GET', '/games/' + encodeURIComponent(current));
+  const keep = document.activeElement && document.activeElement.closest('#detail .nore');
+  if (keep) return; // don't clobber while user is typing
+  document.querySelectorAll('#detail details[open]').forEach((d) => openRooms.add(d.dataset.room));
+  document.querySelectorAll('#detail details:not([open])').forEach((d) => openRooms.delete(d.dataset.room));
+  const origins = (g.settings.allowedOrigins || []).join(', ');
+  const tabs = ['rooms', 'players', 'leaderboards', 'storage', 'settings'];
+  let body = '';
+  if (detailTab === 'rooms') body = g.rooms.length ? g.rooms.map((r) => `<details class="room" data-room="${esc(r.id)}" ${openRooms.has(r.id) ? 'open' : ''}>
+      <summary><b class="mono">${esc(r.id)}</b><span class="tag acc">${r.players.length}/${r.maxPlayers}</span>
+        ${r.tag ? `<span class="tag">${esc(r.tag)}</span>` : ''}${r.private ? '<span class="tag">private</span>' : ''}${r.locked ? '<span class="tag">locked</span>' : ''}${r.persist ? '<span class="tag">persist</span>' : ''}${r.stateWrite === 'host' ? '<span class="tag">host-auth</span>' : ''}
+        <span class="sp"></span><span class="mute">${ago(r.created).replace(' ago', '')} old</span>
+        <button class="sm danger" data-close="${esc(r.id)}">Close</button></summary>
+      <div class="inner">
+        <table><thead><tr><th>Player</th><th>Status</th><th>Data</th><th></th></tr></thead><tbody>
+        ${r.players.map((p) => `<tr><td>${p.id === r.host ? '👑 ' : ''}<b>${esc(p.name)}</b> <span class="mute mono">${esc(p.id)}</span>${p.username ? ` <span class="tag">@${esc(p.username)}</span>` : ''}</td>
+          <td>${p.connected ? '<span class="tag ok">online</span>' : '<span class="tag bad">reconnecting</span>'}</td>
+          <td class="mono mute" style="max-width:380px;overflow:hidden;text-overflow:ellipsis">${esc(p.data)}</td>
+          <td><button class="sm danger" data-kick="${esc(r.id)}|${esc(p.id)}">Kick</button></td></tr>`).join('')}
+        </tbody></table>
+        <div class="mute" style="margin-top:10px">Room state · meta ${esc(JSON.stringify(r.meta))}</div><pre>${esc(pretty(r.state))}</pre>
+      </div></details>`).join('') : '<div class="empty">No active rooms</div>';
+  if (detailTab === 'players') body = `<div class="tablewrap"><table><thead><tr><th></th><th>Name</th><th>ID</th><th>First seen</th><th>Last seen</th></tr></thead><tbody>
+      ${g.recentPlayers.map((p) => `<tr><td><span class="dot ${p.online ? 'on' : ''}"></span></td><td>${esc(p.name)}</td><td class="mono mute">${esc(p.id)}</td><td class="mute">${new Date(p.first_seen).toLocaleString()}</td><td class="mute">${ago(p.last_seen)}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">No players yet</td></tr>'}
+      </tbody></table></div><div class="mute" style="padding:10px 14px">${num(g.accounts)} registered accounts · showing 50 most recent players</div>`;
+  if (detailTab === 'leaderboards') body = g.leaderboards.length ? g.leaderboards.map((b) => `<div class="row" style="padding:8px 0;border-bottom:1px solid var(--line)">
+      <b class="mono">${esc(b.board)}</b><span class="tag">${num(b.entries)} entries</span><span class="mute">${ago(b.updated)}</span><span class="sp"></span>
+      <button class="sm" data-lbview="${esc(b.board)}">View</button><button class="sm danger" data-lbdel="${esc(b.board)}">Reset</button></div>`).join('') + '<pre id="lbOut" class="hidden"></pre>' : '<div class="empty">No leaderboards yet</div>';
+  if (detailTab === 'storage') body = `<div class="row nore"><select id="kvScope" style="width:auto"><option value="">all scopes</option><option>game</option><option>player</option><option>private</option><option>room</option></select>
+      <input id="kvPrefix" placeholder="key prefix" style="width:200px"><button class="sm" id="kvLoad">Search</button></div>
+      <div class="tablewrap"><table style="margin-top:10px"><thead><tr><th>Scope</th><th>Owner</th><th>Key</th><th>Size</th><th>Updated</th><th></th></tr></thead><tbody id="kvRows"><tr><td colspan="6" class="empty">${num(g.kvEntries)} entries — search to browse</td></tr></tbody></table></div><pre id="kvOut" class="hidden"></pre>
+      <div class="row nore" style="margin-top:14px"><input id="kvKey" placeholder="game key (e.g. config)" style="width:200px"><input id="kvVal" placeholder='JSON value, e.g. {"maxSpeed":5}' style="flex:1"><button class="sm" id="kvSet">Set game value</button></div>`;
+  if (detailTab === 'settings') body = `<div class="kv nore">
+      <span class="mute">Allowed origins</span><div class="row"><input id="sOrigins" value="${esc(origins)}" placeholder="any — or e.g. https://me.github.io, http://localhost:5173" style="flex:1"><button class="sm" id="sSave">Save</button></div>
+      <span class="mute">Game data writes</span><div class="row"><select id="sGW" style="width:auto"><option value="all" ${g.settings.gameDataWrite !== 'none' ? 'selected' : ''}>Clients may write game-scope data</option><option value="none" ${g.settings.gameDataWrite === 'none' ? 'selected' : ''}>Read-only for clients (admin only)</option></select></div>
+      <span class="mute">Rename</span><div class="row"><input id="sName" value="${esc(g.name)}" style="flex:1"><button class="sm" id="sRename">Rename</button></div>
+      <span class="mute">Broadcast</span><div class="row"><input id="bType" value="announcement" style="width:160px"><input id="bData" placeholder="message text or JSON" style="flex:1"><button class="sm" id="bSend">Send to all players</button></div>
+      <span class="mute">Danger zone</span><div class="row"><button class="sm" id="sRotate">Rotate key</button><button class="sm danger" id="sDelete">Delete game + all data</button></div></div>`;
+
+  $('#detail').innerHTML = `<button class="sm back" id="back">← All games</button>
+  <div class="grid cards">
+    <div class="card"><div class="k">Online</div><div class="v">${num(g.online)}</div><div class="s">peak ${num(g.peak)}</div></div>
+    <div class="card"><div class="k">Rooms</div><div class="v">${num(g.rooms.length)}</div></div>
+    <div class="card"><div class="k">Msgs / sec</div><div class="v">${num(g.msgRate)}</div></div>
+    <div class="card"><div class="k">All-time players</div><div class="v">${num(g.totalPlayers)}</div><div class="s">${num(g.accounts)} accounts</div></div>
+  </div>
+  <div class="panel" style="margin-top:12px"><h2><span class="dot ${!g.enabled ? 'off' : g.online ? 'on' : ''}"></span> <span style="color:var(--text);text-transform:none;font-size:15px">${esc(g.name)}</span><span class="mono">${esc(g.id)}</span><span class="sp"></span>
+    <button class="sm" id="toggle">${g.enabled ? 'Disable' : 'Enable'}</button></h2>
+    <div class="body kv">
+      <span class="mute">Server URL</span><div class="row"><div class="secret mono" style="flex:1">${esc(SERVER)}</div><button class="sm" data-copy="${esc(SERVER)}">Copy</button></div>
+      <span class="mute">Game key</span><div class="row"><div class="secret mono" style="flex:1">${esc(g.key)}</div><button class="sm" data-copy="${esc(g.key)}">Copy</button></div>
+      <span class="mute">For Claude</span><div class="row"><button class="sm primary" id="cPrompt">Copy integration prompt</button><a class="mute" href="${esc(SERVER)}/demo#key=${encodeURIComponent(g.key)}" target="_blank" rel="noopener">Open demo game ↗</a></div>
+    </div></div>
+  <div class="panel" style="margin-top:12px"><div class="tabs">${tabs.map((t) => `<button data-tab="${t}" class="${t === detailTab ? 'on' : ''}">${t[0].toUpperCase() + t.slice(1)}</button>`).join('')}</div><div class="body">${body}</div></div>`;
+
+  $('#back').onclick = closeGame;
+  $('#cPrompt').onclick = () => copy(claudePrompt(g));
+  $('#toggle').onclick = async () => { await api('PATCH', '/games/' + g.id, { enabled: !g.enabled }); tick(true); };
+  document.querySelectorAll('#detail [data-copy]').forEach((b) => b.onclick = () => copy(b.dataset.copy));
+  document.querySelectorAll('#detail [data-tab]').forEach((b) => b.onclick = () => { detailTab = b.dataset.tab; tick(true); });
+  document.querySelectorAll('#detail [data-close]').forEach((b) => b.onclick = async (e) => { e.preventDefault(); if (confirm('Close room ' + b.dataset.close + '?')) { await api('POST', `/games/${g.id}/rooms/${encodeURIComponent(b.dataset.close)}/close`); tick(); } });
+  document.querySelectorAll('#detail [data-kick]').forEach((b) => b.onclick = async () => { const [r, p] = b.dataset.kick.split('|'); await api('POST', `/games/${g.id}/rooms/${encodeURIComponent(r)}/kick`, { player: p }); toast('Kicked'); tick(); });
+  document.querySelectorAll('#detail [data-lbview]').forEach((b) => b.onclick = async () => { const rows = await api('GET', `/games/${g.id}/leaderboards/${encodeURIComponent(b.dataset.lbview)}`); const o = $('#lbOut'); o.classList.remove('hidden'); o.textContent = rows.map((r, i) => `${String(i + 1).padStart(3)}. ${String(r.score).padStart(10)}  ${r.name}  (${r.id})`).join('\n'); clearInterval(timer); });
+  document.querySelectorAll('#detail [data-lbdel]').forEach((b) => b.onclick = async () => { if (confirm('Reset leaderboard ' + b.dataset.lbdel + '?')) { await api('DELETE', `/games/${g.id}/leaderboards/${encodeURIComponent(b.dataset.lbdel)}`); tick(true); } });
+  if (detailTab === 'storage') {
+    const load = async () => {
+      const rows = await api('GET', `/games/${g.id}/kv?scope=${encodeURIComponent($('#kvScope').value)}&prefix=${encodeURIComponent($('#kvPrefix').value)}`);
+      $('#kvRows').innerHTML = rows.map((r, i) => `<tr><td><span class="tag">${esc(r.scope)}</span></td><td class="mono mute">${esc(r.owner || '—')}</td><td class="mono">${esc(r.k)}</td><td class="mute">${bytes(r.size)}</td><td class="mute">${ago(r.updated)}</td>
+        <td><button class="sm" data-kvv="${i}">View</button> <button class="sm danger" data-kvd="${i}">Delete</button></td></tr>`).join('') || '<tr><td colspan="6" class="empty">No matches</td></tr>';
+      document.querySelectorAll('[data-kvv]').forEach((b) => b.onclick = async () => { const r = rows[b.dataset.kvv]; const v = await api('GET', `/games/${g.id}/kv?scope=${encodeURIComponent(r.scope)}&owner=${encodeURIComponent(r.owner)}&key=${encodeURIComponent(r.k)}`); const o = $('#kvOut'); o.classList.remove('hidden'); o.textContent = JSON.stringify(v && v.value, null, 2); });
+      document.querySelectorAll('[data-kvd]').forEach((b) => b.onclick = async () => { const r = rows[b.dataset.kvd]; if (!confirm('Delete ' + r.k + '?')) return; await api('DELETE', `/games/${g.id}/kv`, { scope: r.scope, owner: r.owner, key: r.k }); load(); });
+    };
+    $('#kvLoad').onclick = load;
+    $('#kvSet').onclick = async () => { let v; try { v = JSON.parse($('#kvVal').value); } catch { v = $('#kvVal').value; } await api('PUT', `/games/${g.id}/kv`, { scope: 'game', key: $('#kvKey').value, value: v }); toast('Saved'); load(); };
+  }
+  paused = !['rooms', 'players'].includes(detailTab); // live-refresh only the live tabs
+  if (detailTab === 'settings') {
+    $('#sSave').onclick = async () => { const list = $('#sOrigins').value.split(',').map((s) => s.trim()).filter(Boolean); await api('PATCH', '/games/' + g.id, { settings: { allowedOrigins: list, gameDataWrite: $('#sGW').value } }); toast('Saved'); };
+    $('#sGW').onchange = $('#sSave').onclick;
+    $('#sRename').onclick = async () => { await api('PATCH', '/games/' + g.id, { name: $('#sName').value }); toast('Renamed'); tick(true); };
+    $('#bSend').onclick = async () => { let d; try { d = JSON.parse($('#bData').value); } catch { d = $('#bData').value; } const r = await api('POST', `/games/${g.id}/broadcast`, { type: $('#bType').value, data: d }); toast(`Delivered to ${r.delivered}`); };
+    $('#sRotate').onclick = async () => { if (confirm('Rotate key? Existing game builds using the old key stop connecting.')) { await api('PATCH', '/games/' + g.id, { rotateKey: true }); toast('Key rotated'); tick(true); } };
+    $('#sDelete').onclick = async () => { if (prompt(`Type the game name "${g.name}" to delete it and ALL its data`) === g.name) { await api('DELETE', '/games/' + g.id); toast('Deleted'); closeGame(); } };
+  }
+}
+
+addEventListener('resize', () => lastOverview && !current && drawChart(lastOverview.history));
+if (SERVER && TOKEN) start(); else showLogin();
+</script>
+</body>
+</html>

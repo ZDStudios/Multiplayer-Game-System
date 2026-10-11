@@ -1,0 +1,14 @@
+{
+  "name": "mp-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Generic multiplayer backend: rooms, realtime state, storage, leaderboards, accounts.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/index.js",
+    "test": "node --disable-warning=ExperimentalWarning test/smoke.js"
+  },
+  "engines": { "node": ">=22.13" },
+  "dependencies": { "ws": "^8.18.0" }
+}

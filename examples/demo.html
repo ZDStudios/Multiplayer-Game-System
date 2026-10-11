@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coin Arena Demo</title>
+<style>
+  :root { --bg:#0b0d12; --panel:#12151c; --line:#232836; --text:#e6e8ee; --mute:#8b93a7; --acc:#38bdf8; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px system-ui, sans-serif; display:flex; height:100vh; }
+  #side { width:280px; border-right:1px solid var(--line); padding:14px; display:flex; flex-direction:column; gap:10px; }
+  #stage { flex:1; position:relative; }
+  canvas { position:absolute; inset:0; width:100%; height:100%; }
+  input, button { font:inherit; color:inherit; background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:7px 10px; }
+  button { cursor:pointer; } button:hover { border-color:var(--acc); }
+  #chat { flex:1; overflow:auto; background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px; font-size:13px; }
+  .mute { color:var(--mute); } .row { display:flex; gap:6px; } .row input { flex:1; min-width:0; }
+  #scores div { display:flex; justify-content:space-between; }
+  @media (max-width:700px) { body { flex-direction:column-reverse; } #side { width:auto; height:45vh; border-right:0; border-top:1px solid var(--line); } }
+</style>
+</head>
+<body>
+<div id="side">
+  <b>Coin Arena <span class="mute" id="status">connecting…</span></b>
+  <div class="row"><input id="code" placeholder="room code"><button id="joinBtn">Join</button><button id="newBtn">New</button></div>
+  <div class="mute" id="roomInfo"></div>
+  <div id="scores"></div>
+  <div id="chat"></div>
+  <form class="row" id="chatForm"><input id="msg" placeholder="say something…" autocomplete="off"><button>Send</button></form>
+  <div class="mute" style="font-size:12px">Move: mouse / WASD. Grab coins. The host spawns coins and validates pickups.</div>
+</div>
+<div id="stage"><canvas id="cv"></canvas></div>
+<script src="../client/multiplayer.js" onerror="this.remove()"></script>
+<script>
+(async () => {
+  // Served by the server at /demo → SDK at /sdk.js. Opened from disk → ../client/multiplayer.js.
+  if (!window.Multiplayer) await new Promise((r) => { const s = document.createElement('script'); s.src = '/sdk.js'; s.onload = r; document.head.appendChild(s); });
+  const params = new URLSearchParams(location.hash.slice(1) + '&' + location.search.slice(1));
+  const SERVER = params.get('server') || (location.protocol.startsWith('http') ? location.origin : prompt('Server URL'));
+  const KEY = params.get('key') || localStorage.getItem('demo_key') || prompt('Game key (pk_...)');
+  localStorage.setItem('demo_key', KEY);
+
+  const $ = (s) => document.querySelector(s);
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const W = 1000, H = 700, COLORS = ['#38bdf8', '#a78bfa', '#34d399', '#fbbf24', '#f87171', '#f472b6', '#2dd4bf', '#fb923c'];
+  const color = (id) => COLORS[[...id].reduce((a, c) => a + c.charCodeAt(0), 0) % COLORS.length];
+
+  const mp = window.mp = new Multiplayer({ url: SERVER, key: KEY, name: 'Guest' + Math.floor(Math.random() * 1000) }); // window.mp for console poking
+  const chat = (html) => { $('#chat').insertAdjacentHTML('beforeend', `<div>${html}</div>`); $('#chat').scrollTop = 1e9; };
+
+  mp.on('connected', () => { $('#status').textContent = `· ${mp.name}`; });
+  mp.on('reconnecting', () => { $('#status').textContent = '· reconnecting…'; });
+  mp.on('joined', (room) => { $('#roomInfo').textContent = `Room ${room.id} — share this code`; location.hash = `key=${KEY}&room=${room.id}`; chat(`<i class="mute">joined ${room.id}</i>`); });
+  mp.on('playerJoined', (p) => chat(`<i class="mute">${esc(p.name)} joined</i>`));
+  mp.on('playerLeft', (p) => chat(`<i class="mute">${esc(p.name || p.id)} left</i>`));
+  mp.on('host', (id, me) => me && chat('<i class="mute">you are now the host</i>'));
+  mp.onMessage('chat', (d, from) => chat(`<b style="color:${color(from)}">${esc(mp.players.get(from)?.name || '?')}</b>: ${esc(d.text)}`));
+  mp.onMessage('announcement', (d) => chat(`<b>📣 server</b>: ${esc(typeof d === 'string' ? d : JSON.stringify(d))}`));
+
+  // ---- host-authoritative coin logic: clients *request* a pickup, host validates + writes state ----
+  mp.onMessage('pickup', (coinId, from) => {
+    if (!mp.isHost) return;
+    const coin = mp.state.coins?.[coinId], p = mp.players.get(from);
+    if (!coin || !p || Math.hypot(p.data.x - coin.x, p.data.y - coin.y) > 40) return; // validate
+    mp.batchState([[`coins.${coinId}`, null, 1], [`scores.${from}`, (mp.state.scores?.[from] || 0) + 1]]);
+    mp.leaderboard.submit('coins', 1, { mode: 'sum' }).catch(() => {});
+  });
+  setInterval(() => {
+    if (!mp.isHost) return;
+    const n = Object.keys(mp.state.coins || {}).length;
+    if (n < 8) mp.setState(`coins.c${Date.now().toString(36)}`, { x: 40 + Math.random() * (W - 80), y: 40 + Math.random() * (H - 80) });
+  }, 700);
+
+  mp.on('state', () => {
+    const s = mp.state.scores || {};
+    $('#scores').innerHTML = [...mp.players.values()].sort((a, b) => (s[b.id] || 0) - (s[a.id] || 0))
+      .map((p) => `<div><span style="color:${color(p.id)}">${p.id === mp.room.host ? '👑 ' : ''}${esc(p.name)}${p.connected ? '' : ' (away)'}</span><b>${s[p.id] || 0}</b></div>`).join('');
+  });
+
+  await mp.connect();
+  const want = params.get('room');
+  await (want ? mp.join(want, { maxPlayers: 12 }) : mp.quickJoin('arena', { maxPlayers: 12 }));
+  mp.setPlayer({ x: W / 2, y: H / 2 });
+
+  $('#joinBtn').onclick = () => $('#code').value && mp.join($('#code').value.trim().toUpperCase()).catch((e) => chat(`<i>${esc(e.message)}</i>`));
+  $('#newBtn').onclick = () => mp.create({ maxPlayers: 12 });
+  $('#chatForm').onsubmit = (e) => { e.preventDefault(); const text = $('#msg').value.trim(); if (!text) return; mp.send('chat', { text }, 'all', { self: true }); $('#msg').value = ''; };
+
+  // ---- input + movement (own position applied locally, sent at 20Hz) ----
+  const cv = $('#cv'), ctx = cv.getContext('2d'), keys = {};
+  let target = null, scale = 1, ox = 0, oy = 0;
+  addEventListener('keydown', (e) => { if (e.target.tagName !== 'INPUT') keys[e.key.toLowerCase()] = true; });
+  addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
+  cv.addEventListener('pointermove', (e) => { const r = cv.getBoundingClientRect(); target = { x: (e.clientX - r.left - ox) / scale, y: (e.clientY - r.top - oy) / scale }; });
+  cv.addEventListener('pointerleave', () => { target = null; });
+  let lastSend = 0;
+  const shown = new Map(); // interpolated positions of remote players
+
+  function frame(t) {
+    const me = mp.me;
+    if (me && me.data.x != null) {
+      let { x, y } = me.data, dx = (keys.d || keys.arrowright ? 1 : 0) - (keys.a || keys.arrowleft ? 1 : 0), dy = (keys.s || keys.arrowdown ? 1 : 0) - (keys.w || keys.arrowup ? 1 : 0);
+      if (!dx && !dy && target) { const ddx = target.x - x, ddy = target.y - y, d = Math.hypot(ddx, ddy); if (d > 4) { dx = ddx / d; dy = ddy / d; } }
+      const len = Math.hypot(dx, dy) || 1;
+      x = Math.max(15, Math.min(W - 15, x + (dx / len) * 5)); y = Math.max(15, Math.min(H - 15, y + (dy / len) * 5));
+      me.data.x = x; me.data.y = y;
+      if (t - lastSend > 50 && (dx || dy)) { lastSend = t; mp.setPlayer({ x: Math.round(x), y: Math.round(y) }); }
+      for (const [id, c] of Object.entries(mp.state.coins || {})) if (Math.hypot(x - c.x, y - c.y) < 30 && !c._asked) { c._asked = 1; mp.send('pickup', id, 'host', { self: true }); }
+    }
+    cv.width = cv.clientWidth * devicePixelRatio; cv.height = cv.clientHeight * devicePixelRatio;
+    scale = Math.min(cv.clientWidth / W, cv.clientHeight / H); ox = (cv.clientWidth - W * scale) / 2; oy = (cv.clientHeight - H * scale) / 2;
+    ctx.setTransform(devicePixelRatio * scale, 0, 0, devicePixelRatio * scale, devicePixelRatio * ox, devicePixelRatio * oy);
+    ctx.fillStyle = '#10131a'; ctx.fillRect(0, 0, W, H); ctx.strokeStyle = '#232836'; ctx.strokeRect(0, 0, W, H);
+    for (const c of Object.values(mp.state.coins || {})) { ctx.fillStyle = '#fbbf24'; ctx.beginPath(); ctx.arc(c.x, c.y, 9, 0, 7); ctx.fill(); }
+    for (const p of mp.players.values()) {
+      if (p.data.x == null) continue;
+      let s = shown.get(p.id) || { x: p.data.x, y: p.data.y };
+      if (p.id === mp.playerId) s = { x: p.data.x, y: p.data.y }; else { s.x += (p.data.x - s.x) * 0.25; s.y += (p.data.y - s.y) * 0.25; }
+      shown.set(p.id, s);
+      ctx.globalAlpha = p.connected ? 1 : 0.35; ctx.fillStyle = color(p.id);
+      ctx.beginPath(); ctx.arc(s.x, s.y, 15, 0, 7); ctx.fill();
+      ctx.fillStyle = '#e6e8ee'; ctx.font = '13px system-ui'; ctx.textAlign = 'center'; ctx.fillText(p.name, s.x, s.y - 22); ctx.globalAlpha = 1;
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})().catch((e) => { document.body.innerHTML = `<pre style="padding:20px;color:#f87171">${e.message}</pre>`; });
+</script>
+</body>
+</html>
