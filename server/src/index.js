@@ -492,6 +492,7 @@ function hello(c, m) {
   if (Array.isArray(origins) && origins.length && !origins.includes(c.origin)) return c.ws.close(4003, 'origin_not_allowed');
   c.game = game;
   const pid = readToken(game.id, m.token) || 'p_' + rid(8);
+  if ((game.settings.banned || []).includes(pid)) return c.ws.close(4005, 'banned');
   claimIdentity(c, pid);
   const row = S.playerGet.get(game.id, pid);
   c.name = cleanName(m.name) || (row && row.name) || 'Player-' + pid.slice(2, 6);
@@ -588,6 +589,8 @@ async function admin(req, res, parts, url) {
       server: { uptime: Date.now() - started, started, node: process.version, rss: mem.rss, heap: mem.heapUsed,
         connections: conns.size, online: online.size, rooms: rooms.size, msgIn: stats.in, msgOut: stats.out,
         bytesIn: stats.bytesIn, bytesOut: stats.bytesOut, openGames: CFG.openGames },
+      players: [...online.values()].slice(0, 500).map((c) => ({ game: c.game.id, gameName: c.game.name, id: c.pid, name: c.name,
+        username: c.username, room: c.room ? c.room.id : null, since: c.since })),
       history: stats.history, games: [...games.values()].map((g) => gameSummary(g, counts)), events: events.slice(-100).reverse(),
     });
   }
@@ -649,6 +652,18 @@ async function admin(req, res, parts, url) {
       broadcast(r, { t: 'state', ops: [], full: r.state, by: 'server' });
       return json(res, 200, { ok: true });
     }
+  }
+  if (sub === 'players' && sid && method === 'POST') {
+    const b = act === 'kick' ? await readBody(req) : {};
+    const banned = new Set(g.settings.banned || []);
+    if (act === 'unban') { banned.delete(sid); g.settings.banned = [...banned]; saveGame(g); return json(res, 200, { ok: true }); }
+    if (act !== 'kick') throw new E('not_found');
+    if (b.ban) { banned.add(sid); g.settings.banned = [...banned]; saveGame(g); }
+    for (const r of [...rooms.values()]) if (r.game === g && r.players.has(sid)) removeMember(r, sid, 'kicked');
+    const c = online.get(rkey(g.id, sid));
+    if (c) { send(c, { t: 'error', code: 'kicked', message: str(b.reason, 200, 'Kicked by admin') }); c.ws.close(4005, b.ban ? 'banned' : 'kicked'); }
+    log(g.id, 'admin', `${b.ban ? 'Banned' : 'Kicked'} player ${c ? c.name : sid}`);
+    return json(res, 200, { ok: true, wasOnline: !!c });
   }
   if (sub === 'broadcast' && method === 'POST') {
     const b = await readBody(req);
@@ -728,7 +743,7 @@ wss.on('connection', (ws, req) => {
   if (n > CFG.maxConnsPerIp) return ws.close(4029, 'too_many_connections');
   ipConns.set(ip, n);
   const c = { ws, ip, origin: req.headers.origin || '', game: null, pid: null, name: '', username: null, room: null,
-    tokens: CFG.burst, lastRefill: Date.now(), dropped: 0, lastWarn: 0, loginFails: 0, alive: true };
+    tokens: CFG.burst, lastRefill: Date.now(), dropped: 0, lastWarn: 0, loginFails: 0, alive: true, since: Date.now() };
   c.helloTimer = setTimeout(() => !c.game && ws.close(4008, 'hello_timeout'), 10000);
   conns.add(c);
   ws.on('pong', () => { c.alive = true; });

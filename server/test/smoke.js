@@ -109,6 +109,18 @@ try {
   const e = new Multiplayer({ url: BASE, key: game.key }); await e.connect();
   assert.notEqual((await e.quickJoin('ranked', { maxPlayers: 2 })).id, q1.id); ok('quickJoin matchmaking fills then spills');
 
+  assert.ok((await api('GET', '/overview')).body.players.some((p) => p.id === d.playerId)); ok('overview lists online players');
+  const dKicked = new Promise((r) => d.once('kicked', r));
+  await api('POST', `/games/${game.id}/players/${d.playerId}/kick`, {});
+  assert.equal(await dKicked, 'kicked');
+  await waitFor(() => !c.players.has(d.playerId)); ok('admin kick disconnects player + removes from room');
+  await d.connect(); ok('kicked (not banned) player can reconnect');
+  await api('POST', `/games/${game.id}/players/${d.playerId}/kick`, { ban: true });
+  await waitFor(() => !d.connected);
+  await assert.rejects(d.connect()); ok('banned player cannot reconnect');
+  await api('POST', `/games/${game.id}/players/${d.playerId}/unban`);
+  await d.connect(); ok('unban restores access');
+
   await api('PATCH', `/games/${game.id}`, { enabled: false });
   await waitFor(() => !e.connected); ok('disabling game disconnects clients');
 

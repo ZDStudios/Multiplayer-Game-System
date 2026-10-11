@@ -151,7 +151,8 @@
           for (const p of this._pending.values()) { clearTimeout(p.timer); p.reject(new MultiplayerError('disconnected')); }
           this._pending.clear();
           clearInterval(this._pingTimer);
-          const fatal = [4001, 4003, 4004].includes(ev.code);
+          const fatal = [4001, 4003, 4004, 4005].includes(ev.code);
+          if (ev.code === 4005) this._emit('kicked', ev.reason);
           if (!welcomed) reject(new MultiplayerError(ev.reason || 'connect_failed', `Connection closed (${ev.code} ${ev.reason || ''})`));
           if (wasConnected) this._emit('disconnected', { code: ev.code, reason: ev.reason });
           if (fatal) { this._emit('error', new MultiplayerError(ev.reason || 'closed', `Closed by server: ${ev.reason}`)); this._resetRoom(ev.reason); return; }

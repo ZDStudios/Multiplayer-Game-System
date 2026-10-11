@@ -98,8 +98,12 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
       </div>
       <div class="panel" style="margin-top:12px">
         <h2>Games <span class="sp"></span><button class="sm primary" id="newGame">+ New game</button></h2>
-        <div class="tablewrap"><table><thead><tr><th></th><th>Game</th><th>Online</th><th>Rooms</th><th>Msgs/s</th><th>Peak</th><th>All-time players</th><th>Last active</th></tr></thead><tbody id="games"></tbody></table></div>
+        <div class="tablewrap"><table><thead><tr><th></th><th>Game</th><th>Online</th><th>Rooms</th><th>Msgs/s</th><th>Peak</th><th>All-time players</th><th>Last active</th><th></th></tr></thead><tbody id="games"></tbody></table></div>
       </div>
+    </div>
+    <div class="panel" id="playersPanel" style="margin-top:12px">
+      <h2>Players online <span class="tag acc" id="pCount">0</span><span class="sp"></span><input id="pSearch" placeholder="filter name / id / game / room" style="width:240px;text-transform:none;letter-spacing:0"></h2>
+      <div class="tablewrap" style="max-height:420px;overflow:auto"><table><thead><tr><th>Player</th><th>Game</th><th>Room</th><th>Connected</th><th></th></tr></thead><tbody id="players"></tbody></table></div>
     </div>
     <div id="detail" class="hidden"></div>
   </div>
@@ -181,10 +185,35 @@ function renderOverview(o) {
   $('#games').innerHTML = o.games.map((g) => `<tr class="click" data-id="${esc(g.id)}">
     <td><span class="dot ${!g.enabled ? 'off' : g.online ? 'on' : ''}"></span></td>
     <td><b>${esc(g.name)}</b> <span class="mute mono">${esc(g.id)}</span>${g.enabled ? '' : ' <span class="tag bad">disabled</span>'}</td>
-    <td>${num(g.online)}</td><td>${num(g.rooms)}</td><td>${num(g.msgRate)}</td><td>${num(g.peak)}</td><td>${num(g.totalPlayers)}</td><td class="mute">${ago(g.lastActive)}</td></tr>`).join('')
-    || `<tr><td colspan="8" class="empty">No games yet — create one to get a key.</td></tr>`;
+    <td>${num(g.online)}</td><td>${num(g.rooms)}</td><td>${num(g.msgRate)}</td><td>${num(g.peak)}</td><td>${num(g.totalPlayers)}</td><td class="mute">${ago(g.lastActive)}</td>
+    <td>${g.enabled ? `<button class="sm danger" data-power="${esc(g.id)}" data-on="0">⏻ Shut down</button>` : `<button class="sm" data-power="${esc(g.id)}" data-on="1">▶ Start</button>`}</td></tr>`).join('')
+    || `<tr><td colspan="9" class="empty">No games yet — create one to get a key.</td></tr>`;
   document.querySelectorAll('#games tr.click').forEach((tr) => tr.onclick = () => openGame(tr.dataset.id));
+  document.querySelectorAll('#games [data-power]').forEach((b) => b.onclick = async (e) => {
+    e.stopPropagation();
+    const g = o.games.find((x) => x.id === b.dataset.power), on = b.dataset.on === '1';
+    if (!on && !confirm(`Shut down "${g.name}"? All ${g.online} connected players are disconnected and new connections are refused until you start it again.`)) return;
+    await api('PATCH', '/games/' + g.id, { enabled: on }); toast(on ? 'Started' : 'Shut down'); tick();
+  });
+  renderPlayers();
 }
+
+function renderPlayers() {
+  const q = $('#pSearch').value.trim().toLowerCase(), all = lastOverview.players || [];
+  const list = all.filter((p) => !q || [p.name, p.id, p.gameName, p.room, p.username].some((v) => String(v || '').toLowerCase().includes(q)));
+  $('#pCount').textContent = all.length;
+  $('#players').innerHTML = list.map((p, i) => `<tr><td><b>${esc(p.name)}</b> <span class="mute mono">${esc(p.id)}</span>${p.username ? ` <span class="tag">@${esc(p.username)}</span>` : ''}</td>
+    <td>${esc(p.gameName)}</td><td class="mono">${p.room ? esc(p.room) : '<span class="mute">lobby</span>'}</td><td class="mute">${ago(p.since).replace(' ago', '')}</td>
+    <td><button class="sm danger" data-pk="${i}">Kick</button> <button class="sm danger" data-pb="${i}">Ban</button></td></tr>`).join('')
+    || `<tr><td colspan="5" class="empty">${all.length ? 'No matches' : 'Nobody online'}</td></tr>`;
+  const act = (p, ban) => async () => {
+    if (ban && !confirm(`Ban ${p.name} from ${p.gameName}? They can't reconnect with this identity until unbanned (game → Settings).`)) return;
+    await api('POST', `/games/${p.game}/players/${encodeURIComponent(p.id)}/kick`, { ban }); toast(ban ? 'Banned' : 'Kicked'); tick();
+  };
+  document.querySelectorAll('#players [data-pk]').forEach((b) => b.onclick = act(list[b.dataset.pk], false));
+  document.querySelectorAll('#players [data-pb]').forEach((b) => b.onclick = act(list[b.dataset.pb], true));
+}
+$('#pSearch').oninput = () => lastOverview && renderPlayers();
 
 function drawChart(h) {
   const cv = $('#chart'), dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
@@ -211,8 +240,8 @@ $('#newGame').onclick = async () => {
 };
 
 // ---------- game detail ----------
-function openGame(id) { current = id; detailTab = 'rooms'; paused = false; $('#overview').classList.add('hidden'); $('#detail').classList.remove('hidden'); $('#detail').innerHTML = '<div class="empty">Loading…</div>'; tick(); }
-function closeGame() { current = null; $('#detail').classList.add('hidden'); $('#overview').classList.remove('hidden'); tick(); }
+function openGame(id) { $('#playersPanel').classList.add('hidden'); current = id; detailTab = 'rooms'; paused = false; $('#overview').classList.add('hidden'); $('#detail').classList.remove('hidden'); $('#detail').innerHTML = '<div class="empty">Loading…</div>'; tick(); }
+function closeGame() { $('#playersPanel').classList.remove('hidden'); current = null; $('#detail').classList.add('hidden'); $('#overview').classList.remove('hidden'); tick(); }
 
 function claudePrompt(g) {
   return `Add online multiplayer to this game using my multiplayer server.
@@ -261,6 +290,7 @@ async function renderDetail() {
       <span class="mute">Game data writes</span><div class="row"><select id="sGW" style="width:auto"><option value="all" ${g.settings.gameDataWrite !== 'none' ? 'selected' : ''}>Clients may write game-scope data</option><option value="none" ${g.settings.gameDataWrite === 'none' ? 'selected' : ''}>Read-only for clients (admin only)</option></select></div>
       <span class="mute">Rename</span><div class="row"><input id="sName" value="${esc(g.name)}" style="flex:1"><button class="sm" id="sRename">Rename</button></div>
       <span class="mute">Broadcast</span><div class="row"><input id="bType" value="announcement" style="width:160px"><input id="bData" placeholder="message text or JSON" style="flex:1"><button class="sm" id="bSend">Send to all players</button></div>
+      <span class="mute">Banned players</span><div class="row">${(g.settings.banned || []).map((id) => `<span class="tag mono">${esc(id)} <a href="#" data-unban="${esc(id)}" style="color:var(--bad)">unban</a></span>`).join(' ') || '<span class="mute">none</span>'}</div>
       <span class="mute">Danger zone</span><div class="row"><button class="sm" id="sRotate">Rotate key</button><button class="sm danger" id="sDelete">Delete game + all data</button></div></div>`;
 
   $('#detail').innerHTML = `<button class="sm back" id="back">← All games</button>
@@ -271,7 +301,7 @@ async function renderDetail() {
     <div class="card"><div class="k">All-time players</div><div class="v">${num(g.totalPlayers)}</div><div class="s">${num(g.accounts)} accounts</div></div>
   </div>
   <div class="panel" style="margin-top:12px"><h2><span class="dot ${!g.enabled ? 'off' : g.online ? 'on' : ''}"></span> <span style="color:var(--text);text-transform:none;font-size:15px">${esc(g.name)}</span><span class="mono">${esc(g.id)}</span><span class="sp"></span>
-    <button class="sm" id="toggle">${g.enabled ? 'Disable' : 'Enable'}</button></h2>
+    <button class="sm ${g.enabled ? 'danger' : ''}" id="toggle">${g.enabled ? '⏻ Shut down' : '▶ Start'}</button></h2>
     <div class="body kv">
       <span class="mute">Server URL</span><div class="row"><div class="secret mono" style="flex:1">${esc(SERVER)}</div><button class="sm" data-copy="${esc(SERVER)}">Copy</button></div>
       <span class="mute">Game key</span><div class="row"><div class="secret mono" style="flex:1">${esc(g.key)}</div><button class="sm" data-copy="${esc(g.key)}">Copy</button></div>
@@ -301,6 +331,7 @@ async function renderDetail() {
   }
   paused = !['rooms', 'players'].includes(detailTab); // live-refresh only the live tabs
   if (detailTab === 'settings') {
+    document.querySelectorAll('[data-unban]').forEach((a) => a.onclick = async (e) => { e.preventDefault(); await api('POST', `/games/${g.id}/players/${encodeURIComponent(a.dataset.unban)}/unban`); toast('Unbanned'); tick(true); });
     $('#sSave').onclick = async () => { const list = $('#sOrigins').value.split(',').map((s) => s.trim()).filter(Boolean); await api('PATCH', '/games/' + g.id, { settings: { allowedOrigins: list, gameDataWrite: $('#sGW').value } }); toast('Saved'); };
     $('#sGW').onchange = $('#sSave').onclick;
     $('#sRename').onclick = async () => { await api('PATCH', '/games/' + g.id, { name: $('#sName').value }); toast('Renamed'); tick(true); };

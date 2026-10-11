@@ -5,7 +5,7 @@ A self-hosted, game-agnostic multiplayer backend. One Docker stack on your VPS g
 - **Realtime rooms**: share codes, matchmaking (`quickJoin`), host election and migration, kick/ban, locking, passwords, reconnects that keep the player's slot.
 - **Three sync channels**: ordered shared room state, per-player data, and relay messages (to everyone, the host, or specific players, plus DMs).
 - **Persistence (SQLite)**: per-player, private and game-wide key/value storage, atomic counters, persistent rooms, leaderboards, username/password accounts.
-- **Admin**: a dashboard (static HTML that runs on GitHub Pages or from the server itself) with live traffic, games, rooms, players, storage browser, leaderboards and broadcasts.
+- **Admin**: one-click shut down / start per game, kick or ban any online player, plus a dashboard (static HTML that runs on GitHub Pages or from the server itself) with live traffic, games, rooms, players, storage browser, leaderboards and broadcasts.
 - **Security**: per-game public keys, an admin bearer token, HMAC-signed player tokens, scrypt passwords, rate limits, message size caps, origin allow-lists, auto-HTTPS via Caddy.
 
 ![Dashboard overview: live players, rooms, traffic and games](docs/images/dashboard.jpg)
@@ -88,4 +88,4 @@ npm test                                  # end-to-end smoke test (26 checks)
 
 All routes take `Authorization: Bearer ADMIN_TOKEN`.
 
-`GET /api/admin/overview` · `GET|POST /api/admin/games` · `GET|PATCH|DELETE /api/admin/games/:id` (PATCH accepts `{name, enabled, rotateKey, settings:{allowedOrigins, gameDataWrite}}`) · `POST /api/admin/games/:id/rooms/:room/close|kick|state` · `POST /api/admin/games/:id/broadcast` · `GET|PUT|DELETE /api/admin/games/:id/kv` · `GET|DELETE /api/admin/games/:id/leaderboards/:board`
+`GET /api/admin/overview` (includes online players) · `POST /api/admin/games/:id/players/:pid/kick` (`{ban, reason}`) · `POST /api/admin/games/:id/players/:pid/unban` · `GET|POST /api/admin/games` · `GET|PATCH|DELETE /api/admin/games/:id` (PATCH accepts `{name, enabled, rotateKey, settings:{allowedOrigins, gameDataWrite}}`) · `POST /api/admin/games/:id/rooms/:room/close|kick|state` · `POST /api/admin/games/:id/broadcast` · `GET|PUT|DELETE /api/admin/games/:id/kv` · `GET|DELETE /api/admin/games/:id/leaderboards/:board`

@@ -174,7 +174,7 @@ Logging in leaves the current room. Rejoin afterwards. A login kicks any other a
 | `reconnected` | `{room}`. The room snapshot has already been re-applied. |
 | `joined` | `room`. Fires after create, join, quickJoin and rejoin. |
 | `left` | `(room, reason)`. reason: `left`, `kicked`, `closed_by_admin`, `replaced`, ... |
-| `kicked` | Fires before `left`. |
+| `kicked` | Kicked from the room by the host (fires before `left`), or kicked/banned from the whole game by the admin (`reason` is `kicked` or `banned`; the connection closes and does not auto-reconnect). |
 | `playerJoined` / `playerLeft` | `(player)` / `(player, reason)` |
 | `playerUpdated` | `(player, changedData)`. Also fires for your own `setPlayer`. |
 | `playerConnection` | `(player, connected)`. Temporary drop or return. |
@@ -286,7 +286,7 @@ Server pushes:
 - `{t:"msg", type, data, from, direct?}`
 - `{t:"error", code, message}`
 
-Close codes: `4001` replaced by another session, `4003` bad key or origin, `4004` game disabled or deleted, `4008` hello timeout, `4029` rate limited. Don't auto-reconnect on 4001, 4003 or 4004. On other closes, reconnect with backoff, send hello with the saved token, then `join` the same room id within 15 s to keep the slot.
+Close codes: `4001` replaced by another session, `4003` bad key or origin, `4004` game disabled or deleted, `4005` kicked or banned by admin, `4008` hello timeout, `4029` rate limited. Don't auto-reconnect on 4001, 4003, 4004 or 4005. On other closes, reconnect with backoff, send hello with the saved token, then `join` the same room id within 15 s to keep the slot.
 
 ## 9. Limits
 
