@@ -67,10 +67,11 @@ Pick based on the game type and say which one you chose:
 | Game type | Pattern |
 |---|---|
 | Turn-based, board, card, party, quiz, puzzle | **Shared state.** Put the whole game in `room.state` and write with `setState`/`batchState`. Optionally set `stateWrite: 'host'` and have clients *request* moves from the host. |
-| Real-time action with rules that matter (scoring, damage, pickups, win conditions) | **Host-authoritative.** Clients send inputs or intents with `mp.send(type, data, 'host')`. The host validates them, simulates, and writes results to `room.state`. Movement can stay client-side in `setPlayer`. Create the room with `stateWrite: 'host'`. |
+| Real-time action with rules that matter (scoring, damage, pickups, win conditions, competitive) | **Server script (preferred).** Put the rules in a server script (§5b). Clients send intents with `mp.send(type, data, 'server')`. The script validates them and writes `room.state`. That's **1 round trip**. Movement stays client-side in `setPlayer` and is rendered with `mp.predict()`. |
+| Same, but you can't install a server script | **Host-authoritative.** Clients send intents with `mp.send(type, data, 'host')`, and the host validates them and writes `room.state` (`stateWrite: 'host'`). This costs **2 round trips** (client → server → host → server → everyone), so mask it with local prediction (§6a). |
 | Casual real-time (cursors, movement, co-op sandbox) | **Client-authoritative.** Each client owns its avatar via `setPlayer({x,y,...})` at 10–20 Hz. Interpolate remote players. Use `send` for events. |
 
-There is no server-side game code. Anything "authoritative" runs on the host client. Host migration is automatic, so any client must be able to take over as host from `room.state` alone. **Keep all authoritative data in `room.state`, not in host-local variables.**
+Authoritative logic runs either in a **server script** (§5b, fastest and cheat-resistant) or on the **host client**. With the host pattern: Host migration is automatic, so any client must be able to take over as host from `room.state` alone. **Keep all authoritative data in `room.state`, not in host-local variables.**
 
 ## 5. API reference
 
@@ -90,6 +91,7 @@ new Multiplayer({
 | Call | Notes |
 |---|---|
 | `await mp.connect()` | Resolves `{playerId, name, username, returning}`. Rejects on a bad key, a disabled game or an origin that isn't allowed. |
+| `await mp.connect({ quickJoin: 'tag', options })` / `{ room: 'ID', options }` / `{ create: true, options }` | Connects **and** joins in one round trip (the join is pipelined behind the handshake). Prefer this over `connect()` followed by `join()`. |
 | `mp.disconnect()` | Intentional close, no auto-reconnect. |
 | `mp.connected`, `mp.playerId`, `mp.name`, `mp.username`, `mp.latency` | |
 | `mp.serverTime()` | Server-synced clock in ms. Use it for countdowns or round timers all clients agree on, e.g. store `endsAt: mp.serverTime() + 60000` in state. |
@@ -118,15 +120,17 @@ new Multiplayer({
 | `await mp.batchState([[path, value], [path, null, 1 /*delete*/]])` or `batchState({path: value})` | Atomic. Everyone receives it as one update. |
 | `mp.state`, `mp.getState('a.b')` | **Read-only locally.** Never mutate `mp.state` directly. Always write through the calls above. |
 
-Writes are applied when the server echoes them back (about 1 RTT), so every client sees the same order. A rejected write (for example `not_host`) rejects the promise. For high-frequency data (60 Hz positions) use `setPlayer`, not `setState`.
+**Optimistic by default.** Your own writes apply to `mp.state` immediately (a `state` event fires with `{optimistic: true}`). Other clients get them about half an RTT later. The server still decides the order: if someone else's write lands first, your copy is reconciled automatically. If the write is rejected (`not_host`, or the room is server-authoritative), the promise rejects and `mp.state` rolls back to the server's version (`mp.resync()`). Turn it off with `new Multiplayer({ optimistic: false })`. For high-frequency data (60 Hz positions) use `setPlayer`, not `setState`.
 
 ### Per-player data
-`mp.setPlayer({x, y, hp: null /*null deletes*/}, {replace=false})` is fire-and-forget. It's applied to `mp.me.data` immediately and merged into `player.data` on other clients. Throttle to ≤ 20 Hz and send only changed fields.
+`mp.setPlayer({x, y, hp: null /*null deletes*/}, {replace=false})` is fire-and-forget. It's applied to `mp.me.data` immediately and merged into `player.data` on other clients. Send at 20–30 Hz (at most 60 messages/s total per client), and only changed fields.
+
+`mp.predict(playerId, keys = ['x','y'], {maxAheadMs: 250})` does dead reckoning for **remote** players. It returns `{x, y}` extrapolated to "now" from the velocity between their last two updates plus half your ping. Render remote players at `predict()` (lerp toward it for smoothness), not at raw `p.data`. Raw data is always about one-way latency + send interval old.
 
 ### Messages
 | Call | Notes |
 |---|---|
-| `mp.send(type, data, to?, {self})` | Fire-and-forget. `to`: omitted for everyone except me, `'all'`, `'host'`, a playerId, or an array of ids. Pass `{self:true}` with `'all'` to receive your own message too. |
+| `mp.send(type, data, to?, {self})` | Fire-and-forget. `to`: omitted for everyone except me, `'all'`, `'host'`, `'server'` (the game's server script, §5b), a playerId, or an array of ids. Pass `{self:true}` with `'all'` to receive your own message too. |
 | `await mp.sendReliable(...)` | Same arguments, but resolves when the server accepts it. |
 | `mp.onMessage(type, (data, fromId, raw) => {})` | `fromId === 'server'` for admin broadcasts (type `announcement` by default). |
 | Outside a room | `mp.send('invite', {room: 'ABC123'}, playerId)` sends a direct message to any online player of the game. |
@@ -187,7 +191,55 @@ Logging in leaves the current room. Rejoin afterwards. A login kicks any other a
 | `error` | `MultiplayerError {code, message}`. Async errors such as `rate_limited` or `replaced`. |
 | `ping` | `latency` |
 
-Request errors reject with `MultiplayerError` (`err.code`): `not_connected`, `timeout`, `not_in_room`, `not_host`, `room_full`, `room_locked`, `room_not_found`, `bad_password`, `banned`, `bad_path`, `bad_key`, `bad_scope`, `forbidden`, `too_large`, `username_taken`, `bad_credentials`, `already_registered`, `player_offline`.
+Request errors reject with `MultiplayerError` (`err.code`): `not_connected`, `timeout`, `not_in_room`, `not_host`, `room_full`, `room_locked`, `room_not_found`, `bad_password`, `banned`, `bad_path`, `bad_key`, `bad_scope`, `forbidden`, `too_large`, `username_taken`, `bad_credentials`, `already_registered`, `player_offline`, `no_server_script`.
+
+## 5b. Server scripts (authoritative logic on the server)
+
+Each game can have **one server script**: a CommonJS module that runs on the server for every room of that game. The user installs it in the dashboard under **Game → Server logic → Save & deploy**, or through the admin API: `PUT SERVER_URL/api/admin/games/GAME_ID/script` with `{"code": "..."}` and `Authorization: Bearer ADMIN_TOKEN`. The admin token is the user's secret. Never put it in client code. If you write a server script, **save it in the project as `server-script.js` and tell the user to paste it into Server logic**.
+
+```js
+module.exports = {
+  authoritative: true,   // clients can't setState in this game's rooms; only the script writes state
+  tickRate: 20,          // onTick calls per second (1–60). Omit for no tick loop.
+
+  onCreate(room) {},                        // new room; initialize room.state here
+  onJoin(room, player) {},                  // player = {id, name, data, connected, joined, username}
+  onLeave(room, player, reason) {},
+  onMessage(room, player, type, data) {},   // from mp.send(type, data, 'server')
+  onTick(room, dt) {},                      // dt in seconds
+};
+```
+
+| `room` API (inside the script) | |
+|---|---|
+| `room.id`, `room.meta`, `room.host`, `room.players` (array), `room.player(id)` | Read-only views. |
+| `room.state` / `room.getState('a.b')` | Read. |
+| `room.setState(path, value)`, `room.deleteState(path)`, `room.batchState([[path, value], [path, null, 1]])` | All writes in one hook call are sent to clients as **one** batched update. |
+| `room.send(type, data, to?)` | `to`: omitted for everyone, a playerId, or an array. Clients receive it with `from === 'server'`. |
+| `room.kick(id, reason?)`, `room.lock(true/false)`, `room.now()` | |
+| `room.data` | Server-only scratch object, never sent to clients. Use it for secrets, RNG seeds and AI state. |
+| `console.log(...)` | Shown in the dashboard activity feed. |
+
+Rules: plain synchronous JS with no `require`, network, filesystem or timers (use `onTick`). Each hook call is limited to **50 ms of CPU**. A hook that throws or loops forever is stopped, logged under Server logic → errors, and the server keeps running. Validate everything in `onMessage`, because `data` comes from clients.
+
+## 5c. Latency: what to expect and how to minimise it
+
+Every message pays the network round trip between the player and the server (RTT, shown as `mp.latency`). The server adds about 1 ms. Design for this:
+
+| Path | Cost |
+|---|---|
+| Your own `setPlayer` / `setState` (optimistic) | **0 ms** for you |
+| You → other players (`setPlayer`, `send`, `setState`) | about **½ RTT** your side + ½ RTT theirs |
+| Intent → server script → everyone sees the result | **1 RTT** |
+| Intent → host client → everyone sees the result | **2 RTT**. Avoid it for fast-paced games. |
+
+Techniques, all expected for action games:
+1. **Client-side prediction.** Apply your own actions locally the moment the input happens (move, shoot animation, sound), then reconcile when the authoritative state arrives.
+2. **Dead reckoning.** Render remote players at `mp.predict(id)`, not raw data.
+3. **Server scripts** for authority instead of the host (1 RTT instead of 2).
+4. **Send rate.** Use `setPlayer` at 20–30 Hz with small payloads (round numbers and short keys). Don't send unchanged data.
+5. **One-RTT start.** Use `connect({ quickJoin | room | create })`.
+6. **Shared clock.** Use `mp.serverTime()` for anything timed, such as countdowns, cooldowns and projectile spawn times, so clients agree regardless of latency.
 
 ## 6. Recipes
 
@@ -231,7 +283,26 @@ function update(t) {
 }
 ```
 
-**Host-authoritative world (pickups, enemies, scoring)**: the host runs the simulation loop (`if (mp.isHost) tick()`) and writes compact results with `batchState` at 5–15 Hz. Clients send intents (`mp.send('shoot', {...}, 'host')`) and render `mp.state`. Because the whole world lives in `room.state`, a migrated host continues seamlessly (`mp.on('host', (_, me) => me && startSimLoop())`).
+**Server-authoritative combat (fastest authoritative pattern)**
+```js
+// client: predict locally, ask the server to confirm
+fireBtn.onclick = () => { playShotFx(); mp.send('shoot', { target: aimedId }, 'server'); };
+mp.on('state:hp', hp => renderHealthBars(hp));
+// server-script.js (user pastes it into Dashboard → Server logic)
+module.exports = {
+  authoritative: true,
+  onJoin(room, p) { room.setState('hp.' + p.id, 100); },
+  onMessage(room, p, type, d) {
+    if (type !== 'shoot') return;
+    const now = room.now(), last = room.data['cd_' + p.id] || 0;
+    if (now - last < 250 || room.getState('hp.' + d.target) == null) return;   // cooldown + validation
+    room.data['cd_' + p.id] = now;
+    room.setState('hp.' + d.target, Math.max(0, room.getState('hp.' + d.target) - 10));
+  },
+};
+```
+
+**Host-authoritative world (no server script available)**: the host runs the simulation loop (`if (mp.isHost) tick()`) and writes compact results with `batchState` at 5–15 Hz. Clients send intents (`mp.send('shoot', {...}, 'host')`) and render `mp.state`. Because the whole world lives in `room.state`, a migrated host continues seamlessly (`mp.on('host', (_, me) => me && startSimLoop())`).
 
 **Save/load progress**: `mp.storage.set('save', data)` on checkpoints and `const save = await mp.storage.get('save')` after `connect()`. Use `identity: 'device'` or accounts.
 
@@ -246,7 +317,8 @@ function update(t) {
 3. Build a minimal lobby UI: **Quick play** (`quickJoin`), **Create room** (shows the code), **Join by code**. Show the player list with names and connection status.
 4. Pick a sync pattern from §4 and say which one in a code comment.
 5. Handle `playerJoined`, `playerLeft`, `playerConnection`, `host`, `reconnecting` / `reconnected`, `left` (kicked or closed) and `error`.
-6. Throttle `setPlayer` to ≤ 20 Hz. Batch state writes. Never mutate `mp.state` directly.
+6. Throttle `setPlayer` to 20–30 Hz. Batch state writes. Never mutate `mp.state` directly. Use `connect({quickJoin|room|create})`.
+6b. For action games: predict local actions, render remote players with `mp.predict()`, and put authoritative rules in a server script (`server-script.js` for the user to paste into the dashboard) instead of on the host.
 7. Escape player-supplied text (names, chat) before inserting it as HTML.
 8. Make sure single-player still works if the game had it, or that the game degrades gracefully when the server is unreachable.
 9. Test with two browser tabs. The default `identity: 'tab'` makes them different players.
@@ -257,7 +329,7 @@ WebSocket `wss://HOST/ws`. Messages are text frames of JSON objects with a type 
 
 1. On open, send `{"t":"hello","key":"GAME_KEY","token":"<saved token or omit>","name":"Bob"}`.
 2. The server replies `{"t":"welcome","playerId","token","name","username","serverTime","game":{id,name},"returning"}`. **Persist `token`** and send it on the next hello to stay the same player.
-3. Requests are `{"t":"<type>","rid":<int>, ...fields}`. The response is `{"t":"res","rid":<int>,"ok":true,"d":<data>}` or `{"t":"res","rid","ok":false,"err":{"code","message"}}`. Omit `rid` for fire-and-forget.
+3. Requests are `{"t":"<type>","rid":<int>, ...fields}`. You may send a `join`/`quick`/`create` right after `hello` without waiting for `welcome`. Messages are processed in order, which saves a round trip. The response is `{"t":"res","rid":<int>,"ok":true,"d":<data>}` or `{"t":"res","rid","ok":false,"err":{"code","message"}}`. Omit `rid` for fire-and-forget.
 
 | Request `t` | Fields | Response `d` |
 |---|---|---|
@@ -272,7 +344,7 @@ WebSocket `wss://HOST/ws`. Messages are text frames of JSON objects with a type 
 | `kick` | `id, ban?` | `true` |
 | `state.set` | `ops: [[path, value], [path, null, 1]]` | `true` |
 | `player.set` | `data, replace?` | `true` |
-| `send` | `type, data, to?, self?` | `true` |
+| `send` | `type, data, to?, self?` (`to: "server"` delivers to the game's server script) | `true` |
 | `kv.get` / `kv.set` / `kv.del` / `kv.incr` / `kv.list` | `key, value?, by?, scope?, player?, prefix?, limit?` | value / `true` / number / list |
 | `lb.submit` | `board, score, mode?` | `{score, rank, improved}` |
 | `lb.top` | `board, limit?, order?` | `{board, entries, me}` |
@@ -293,4 +365,5 @@ Close codes: `4001` replaced by another session, `4003` bad key or origin, `4004
 - 64 KB per message and per stored value. Up to 256 state ops per batch.
 - About 60 messages/s sustained per connection (burst 200). Excess messages are dropped with an `error` `rate_limited` event.
 - One room per connection. Rooms are in memory and disappear when empty unless `persist: true`.
-- The server trusts clients. For competitive integrity, use the host-authoritative pattern and validate inside the host's code. Leaderboard submissions are client-reported.
+- Without a server script the server trusts clients. For competitive integrity, use a server script with `authoritative: true` and validate in `onMessage`. Leaderboard submissions are client-reported.
+- Server scripts get 50 ms of CPU per hook call and up to 60 Hz ticks.

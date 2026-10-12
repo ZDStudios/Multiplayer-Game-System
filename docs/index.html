@@ -103,7 +103,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
     </div>
     <div class="panel" id="playersPanel" style="margin-top:12px">
       <h2>Players online <span class="tag acc" id="pCount">0</span><span class="sp"></span><input id="pSearch" placeholder="filter name / id / game / room" style="width:240px;text-transform:none;letter-spacing:0"></h2>
-      <div class="tablewrap" style="max-height:420px;overflow:auto"><table><thead><tr><th>Player</th><th>Game</th><th>Room</th><th>Connected</th><th></th></tr></thead><tbody id="players"></tbody></table></div>
+      <div class="tablewrap" style="max-height:420px;overflow:auto"><table><thead><tr><th>Player</th><th>Game</th><th>Room</th><th>Ping</th><th>Connected</th><th></th></tr></thead><tbody id="players"></tbody></table></div>
     </div>
     <div id="detail" class="hidden"></div>
   </div>
@@ -117,6 +117,7 @@ const fmtDur = (ms) => { const s = Math.floor(ms / 1000), d = Math.floor(s / 864
 const ago = (t) => !t ? '—' : Date.now() - t < 5000 ? 'now' : fmtDur(Date.now() - t) + ' ago';
 const bytes = (n) => n > 1e9 ? (n / 1e9).toFixed(1) + ' GB' : n > 1e6 ? (n / 1e6).toFixed(1) + ' MB' : (n / 1e3).toFixed(0) + ' KB';
 const pretty = (j) => { try { return JSON.stringify(JSON.parse(j), null, 2); } catch { return j; } };
+const ping = (ms) => ms == null ? '<span class="mute">—</span>' : `<span style="color:var(--${ms < 150 ? 'ok' : ms < 300 ? 'warn' : 'bad'})">${ms} ms</span>`;
 const num = (n) => Number(n || 0).toLocaleString();
 const toast = (m) => { const t = $('#toast'); t.textContent = m; t.classList.add('show'); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('show'), 1800); };
 const copy = (s) => navigator.clipboard.writeText(s).then(() => toast('Copied'));
@@ -203,9 +204,9 @@ function renderPlayers() {
   const list = all.filter((p) => !q || [p.name, p.id, p.gameName, p.room, p.username].some((v) => String(v || '').toLowerCase().includes(q)));
   $('#pCount').textContent = all.length;
   $('#players').innerHTML = list.map((p, i) => `<tr><td><b>${esc(p.name)}</b> <span class="mute mono">${esc(p.id)}</span>${p.username ? ` <span class="tag">@${esc(p.username)}</span>` : ''}</td>
-    <td>${esc(p.gameName)}</td><td class="mono">${p.room ? esc(p.room) : '<span class="mute">lobby</span>'}</td><td class="mute">${ago(p.since).replace(' ago', '')}</td>
+    <td>${esc(p.gameName)}</td><td class="mono">${p.room ? esc(p.room) : '<span class="mute">lobby</span>'}</td><td class="mono">${ping(p.rtt)}</td><td class="mute">${ago(p.since).replace(' ago', '')}</td>
     <td><button class="sm danger" data-pk="${i}">Kick</button> <button class="sm danger" data-pb="${i}">Ban</button></td></tr>`).join('')
-    || `<tr><td colspan="5" class="empty">${all.length ? 'No matches' : 'Nobody online'}</td></tr>`;
+    || `<tr><td colspan="6" class="empty">${all.length ? 'No matches' : 'Nobody online'}</td></tr>`;
   const act = (p, ban) => async () => {
     if (ban && !confirm(`Ban ${p.name} from ${p.gameName}? They can't reconnect with this identity until unbanned (game → Settings).`)) return;
     await api('POST', `/games/${p.game}/players/${encodeURIComponent(p.id)}/kick`, { ban }); toast(ban ? 'Banned' : 'Kicked'); tick();
@@ -252,6 +253,28 @@ Full integration guide: ${SERVER}/MULTIPLAYER.md — fetch and follow it (or use
 }
 
 let openRooms = new Set(), kvCache = null;
+const SCRIPT_EXAMPLE = `// Runs on the server: authoritative, 1 round trip. Client: mp.send('hit', { target, dmg }, 'server')
+module.exports = {
+  authoritative: true,   // clients can't write room state directly; only this script can
+  tickRate: 20,          // onTick(room, dt) calls per second
+
+  onCreate(room) { room.setState('hp', {}); room.setState('phase', 'lobby'); },
+  onJoin(room, player) { room.setState('hp.' + player.id, 100); },
+  onLeave(room, player) { room.deleteState('hp.' + player.id); },
+
+  onMessage(room, player, type, data) {
+    if (type === 'hit') {
+      const hp = room.getState('hp.' + data.target);
+      if (hp == null || hp <= 0) return;                 // validate
+      room.setState('hp.' + data.target, Math.max(0, hp - Math.min(data.dmg, 25)));
+      if (hp - data.dmg <= 0) room.send('killed', { by: player.id, target: data.target });
+    }
+  },
+
+  onTick(room, dt) {
+    // e.g. timers, regen, AI, physics. room.data is server-only scratch space.
+  },
+};`;
 async function renderDetail() {
   const g = await api('GET', '/games/' + encodeURIComponent(current));
   const keep = document.activeElement && document.activeElement.closest('#detail .nore');
@@ -259,7 +282,7 @@ async function renderDetail() {
   document.querySelectorAll('#detail details[open]').forEach((d) => openRooms.add(d.dataset.room));
   document.querySelectorAll('#detail details:not([open])').forEach((d) => openRooms.delete(d.dataset.room));
   const origins = (g.settings.allowedOrigins || []).join(', ');
-  const tabs = ['rooms', 'players', 'leaderboards', 'storage', 'settings'];
+  const tabs = ['rooms', 'players', 'server logic', 'leaderboards', 'storage', 'settings'];
   let body = '';
   if (detailTab === 'rooms') body = g.rooms.length ? g.rooms.map((r) => `<details class="room" data-room="${esc(r.id)}" ${openRooms.has(r.id) ? 'open' : ''}>
       <summary><b class="mono">${esc(r.id)}</b><span class="tag acc">${r.players.length}/${r.maxPlayers}</span>
@@ -267,9 +290,9 @@ async function renderDetail() {
         <span class="sp"></span><span class="mute">${ago(r.created).replace(' ago', '')} old</span>
         <button class="sm danger" data-close="${esc(r.id)}">Close</button></summary>
       <div class="inner">
-        <table><thead><tr><th>Player</th><th>Status</th><th>Data</th><th></th></tr></thead><tbody>
+        <table><thead><tr><th>Player</th><th>Status</th><th>Ping</th><th>Data</th><th></th></tr></thead><tbody>
         ${r.players.map((p) => `<tr><td>${p.id === r.host ? '👑 ' : ''}<b>${esc(p.name)}</b> <span class="mute mono">${esc(p.id)}</span>${p.username ? ` <span class="tag">@${esc(p.username)}</span>` : ''}</td>
-          <td>${p.connected ? '<span class="tag ok">online</span>' : '<span class="tag bad">reconnecting</span>'}</td>
+          <td>${p.connected ? '<span class="tag ok">online</span>' : '<span class="tag bad">reconnecting</span>'}</td><td class="mono">${ping(p.rtt)}</td>
           <td class="mono mute" style="max-width:380px;overflow:hidden;text-overflow:ellipsis">${esc(p.data)}</td>
           <td><button class="sm danger" data-kick="${esc(r.id)}|${esc(p.id)}">Kick</button></td></tr>`).join('')}
         </tbody></table>
@@ -285,6 +308,11 @@ async function renderDetail() {
       <input id="kvPrefix" placeholder="key prefix" style="width:200px"><button class="sm" id="kvLoad">Search</button></div>
       <div class="tablewrap"><table style="margin-top:10px"><thead><tr><th>Scope</th><th>Owner</th><th>Key</th><th>Size</th><th>Updated</th><th></th></tr></thead><tbody id="kvRows"><tr><td colspan="6" class="empty">${num(g.kvEntries)} entries — search to browse</td></tr></tbody></table></div><pre id="kvOut" class="hidden"></pre>
       <div class="row nore" style="margin-top:14px"><input id="kvKey" placeholder="game key (e.g. config)" style="width:200px"><input id="kvVal" placeholder='JSON value, e.g. {"maxSpeed":5}' style="flex:1"><button class="sm" id="kvSet">Set game value</button></div>`;
+  if (detailTab === 'server logic') body = `<div class="nore">
+      <div class="row" style="margin-bottom:8px"><span id="scStatus" class="mute">Loading…</span><span class="sp"></span>
+        <button class="sm" id="scExample">Insert example</button><button class="sm danger" id="scRemove">Remove</button><button class="sm primary" id="scSave">Save &amp; deploy</button></div>
+      <textarea id="scCode" spellcheck="false" style="height:420px;font:12.5px/1.45 var(--mono);tab-size:2;white-space:pre" placeholder="// Optional authoritative game logic that runs ON the server (1 round trip instead of 2 via a host client)."></textarea>
+      <div class="mute" style="margin:10px 0 4px">Recent script errors</div><pre id="scErrors">—</pre></div>`;
   if (detailTab === 'settings') body = `<div class="kv nore">
       <span class="mute">Allowed origins</span><div class="row"><input id="sOrigins" value="${esc(origins)}" placeholder="any — or e.g. https://me.github.io, http://localhost:5173" style="flex:1"><button class="sm" id="sSave">Save</button></div>
       <span class="mute">Game data writes</span><div class="row"><select id="sGW" style="width:auto"><option value="all" ${g.settings.gameDataWrite !== 'none' ? 'selected' : ''}>Clients may write game-scope data</option><option value="none" ${g.settings.gameDataWrite === 'none' ? 'selected' : ''}>Read-only for clients (admin only)</option></select></div>
@@ -330,6 +358,22 @@ async function renderDetail() {
     $('#kvSet').onclick = async () => { let v; try { v = JSON.parse($('#kvVal').value); } catch { v = $('#kvVal').value; } await api('PUT', `/games/${g.id}/kv`, { scope: 'game', key: $('#kvKey').value, value: v }); toast('Saved'); load(); };
   }
   paused = !['rooms', 'players'].includes(detailTab); // live-refresh only the live tabs
+  if (detailTab === 'server logic') {
+    const show = (info) => {
+      $('#scStatus').innerHTML = !info.code && !info.loaded ? 'No server script — clients/host run the logic.'
+        : info.failed ? '<span style="color:var(--bad)">Failed to load (see errors)</span>'
+        : `<span class="tag ok">running</span> hooks: <span class="mono">${esc((info.hooks || []).join(', '))}</span>${info.authoritative ? ' · <span class="tag">authoritative</span>' : ''}${info.tickRate ? ` · ${esc(info.tickRate)} Hz tick` : ''}`;
+      $('#scErrors').textContent = (info.errors || []).map((e) => `[${new Date(e.ts).toLocaleTimeString()}] ${e.hook}: ${e.message}`).join('\n\n') || '—';
+    };
+    api('GET', `/games/${g.id}/script`).then((info) => { $('#scCode').value = info.code || ''; show(info); });
+    $('#scCode').onkeydown = (e) => { if (e.key === 'Tab') { e.preventDefault(); const t = e.target, i = t.selectionStart; t.setRangeText('  ', i, t.selectionEnd, 'end'); } };
+    $('#scSave').onclick = async () => {
+      const r = await fetch(SERVER.replace(/\/+$/, '') + `/api/admin/games/${g.id}/script`, { method: 'PUT', headers: { authorization: 'Bearer ' + TOKEN, 'content-type': 'application/json' }, body: JSON.stringify({ code: $('#scCode').value }) });
+      const info = await r.json(); info.code = $('#scCode').value; show(info); toast(r.ok ? 'Deployed' : 'Script failed to load');
+    };
+    $('#scRemove').onclick = async () => { if (!confirm('Remove the server script? Rooms fall back to client/host logic.')) return; show(await api('DELETE', `/games/${g.id}/script`)); $('#scCode').value = ''; toast('Removed'); };
+    $('#scExample').onclick = () => { $('#scCode').value = SCRIPT_EXAMPLE; };
+  }
   if (detailTab === 'settings') {
     document.querySelectorAll('[data-unban]').forEach((a) => a.onclick = async (e) => { e.preventDefault(); await api('POST', `/games/${g.id}/players/${encodeURIComponent(a.dataset.unban)}/unban`); toast('Unbanned'); tick(true); });
     $('#sSave').onclick = async () => { const list = $('#sOrigins').value.split(',').map((s) => s.trim()).filter(Boolean); await api('PATCH', '/games/' + g.id, { settings: { allowedOrigins: list, gameDataWrite: $('#sGW').value } }); toast('Saved'); };

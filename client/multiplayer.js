@@ -61,6 +61,7 @@
      * @param {boolean} [o.autoReconnect=true]
      * @param {number} [o.timeout=10000] Request timeout ms
      * @param {Function} [o.WebSocket]   Custom WebSocket implementation (e.g. `ws` in older Node)
+     * @param {boolean} [o.optimistic=true] Apply your own setState writes locally at once (server order still wins)
      */
     constructor(o = {}) {
       if (!o.url || !o.key) throw new Error('Multiplayer: { url, key } are required');
@@ -68,7 +69,8 @@
       if (!/\/ws$/.test(url)) url += '/ws';
       this.url = url;
       this.key = o.key;
-      this.opts = Object.assign({ identity: 'tab', autoReconnect: true, timeout: 10000 }, o);
+      this.opts = Object.assign({ identity: 'tab', autoReconnect: true, timeout: 10000, optimistic: true }, o);
+      this._optim = []; // my state batches applied locally, awaiting the server echo
       this._WS = o.WebSocket || globalThis.WebSocket;
       this._store = storageFor(this.opts.identity);
       this._tokenKey = 'mp_token_' + this.key;
@@ -88,6 +90,7 @@
       this.state = {};       // shared room state (read-only locally; write via setState)
       this.players = new Map(); // id -> { id, name, data, connected, joined, username }
       this.latency = 0;
+      this._samples = new Map(); // playerId -> last two data samples (for predict())
       this.storage = {
         get: (key, o = {}) => this.request('kv.get', { key, scope: o.scope, player: o.player }),
         set: (key, value, o = {}) => this.request('kv.set', { key, value, scope: o.scope }),
@@ -123,9 +126,17 @@
     onMessage(type, fn) { return this.on('msg:' + type, fn); }
 
     // ---------- connection ----------
-    connect() {
+    /**
+     * Connect. Optionally join in the same round trip (saves ~1 RTT):
+     *   await mp.connect({ room: 'ABC123', options })  |  { quickJoin: 'tag', options }  |  { create: true, options }
+     */
+    connect(o = {}) {
       this._closedByUser = false;
       if (this._connecting) return this._connecting;
+      if (o.room != null) this._autoJoin = ['join', { room: o.room, options: o.options || {} }];
+      else if (o.quickJoin != null) this._autoJoin = ['quick', { tag: o.quickJoin, options: o.options || {} }];
+      else if (o.create) this._autoJoin = ['create', { options: o.options || {} }];
+      if (this._autoJoin) this._lastJoinOpts = { password: (o.options || {}).password };
       this._connecting = new Promise((resolve, reject) => {
         let ws;
         try { ws = new this._WS(this.url); } catch (e) { this._connecting = null; return reject(e); }
@@ -133,6 +144,11 @@
         let welcomed = false;
         ws.onopen = () => {
           ws.send(JSON.stringify({ t: 'hello', v: 1, key: this.key, token: this._store.getItem(this._tokenKey) || undefined, name: this.name || undefined }));
+          // Pipeline: send the (re)join right behind hello instead of waiting for welcome.
+          const j = this.room && this._retry > 0 ? ['join', { room: this.room.id, options: this._lastJoinOpts || {} }] : this._autoJoin;
+          this._autoJoin = null;
+          this._joinP = j ? this._send(j[0], j[1]) : null;
+          if (this._joinP) this._joinP.catch(() => {});
         };
         ws.onmessage = (ev) => {
           let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
@@ -174,13 +190,15 @@
       this.connected = true;
       const reconnecting = this._retry > 0;
       this._retry = 0;
-      this._pingTimer = setInterval(() => this.ping().catch(() => {}), 10000);
+      this._pingTimer = setInterval(() => this.ping().catch(() => {}), 5000);
       this.ping().catch(() => {});
+      const joinP = this._joinP; this._joinP = null;
       if (reconnecting && this.room) {
-        const id = this.room.id;
-        try { this._applySnapshot(await this.request('join', { room: id, options: this._lastJoinOpts || {} })); }
+        try { this._applySnapshot(await (joinP || this.request('join', { room: this.room.id, options: this._lastJoinOpts || {} }))); }
         catch (e) { this._resetRoom('rejoin_failed'); }
         this._emit('reconnected', { room: this.room });
+      } else if (joinP) {
+        this._applySnapshot(await joinP); // connect({room|quickJoin|create}) — rejects connect() if the join fails
       }
       this._emit('connected', { playerId: this.playerId, name: this.name, username: this.username, returning: m.returning });
       return { playerId: this.playerId, name: this.name, username: this.username, returning: m.returning };
@@ -212,8 +230,12 @@
     // ---------- requests ----------
     /** Low-level: send a typed request, resolves with server data or rejects with MultiplayerError */
     request(t, payload = {}) {
+      if (!this.connected) return Promise.reject(new MultiplayerError('not_connected'));
+      return this._send(t, payload);
+    }
+    _send(t, payload) {
       return new Promise((resolve, reject) => {
-        if (!this._ws || this._ws.readyState !== 1 || !this.connected) return reject(new MultiplayerError('not_connected'));
+        if (!this._ws || this._ws.readyState !== 1) return reject(new MultiplayerError('not_connected'));
         const rid = ++this._rid;
         const timer = setTimeout(() => { this._pending.delete(rid); reject(new MultiplayerError('timeout')); }, this.opts.timeout);
         this._pending.set(rid, { resolve, reject, timer });
@@ -236,7 +258,11 @@
           return m.ok ? p.resolve(m.d) : p.reject(new MultiplayerError(m.err.code, m.err.message));
         }
         case 'state': {
-          if (m.full) this.state = m.full;
+          if (m.by === this.playerId && this._optim.length) {
+            const mine = this._optim.shift();
+            if (!mine.dirty) return; // already applied locally and nothing interleaved: skip the echo
+          } else for (const b of this._optim) b.dirty = true; // someone else's write landed in between
+          if (m.full) { this.state = m.full; this._optim = []; }
           for (const [p, v, del] of m.ops) setPath(this.state, p, v, !!del);
           this._emit('state', this.state, { ops: m.ops, by: m.by });
           for (const [p, v] of m.ops) this._emit('state:' + p.split('.')[0], getPath(this.state, p.split('.')[0]), { path: p, value: v, by: m.by });
@@ -246,7 +272,13 @@
           const pl = this.players.get(m.id);
           if (!pl) return;
           if (m.name) pl.name = m.name;
-          if (m.data) { if (m.replace) pl.data = {}; merge(pl.data, m.data); }
+          if (m.data) {
+            const now = Date.now(), prev = this._samples.get(m.id);
+            if (m.replace) pl.data = {};
+            const before = prev ? prev.cur : null;
+            merge(pl.data, m.data);
+            this._samples.set(m.id, { prev: before, prevT: prev ? prev.t : 0, cur: Object.assign({}, pl.data), t: now });
+          }
           return this._emit('playerUpdated', pl, m.data || {});
         }
         case 'player.joined': {
@@ -256,6 +288,7 @@
         case 'player.left': {
           const pl = this.players.get(m.id);
           this.players.delete(m.id);
+          this._samples.delete(m.id);
           return this._emit('playerLeft', pl || { id: m.id }, m.reason);
         }
         case 'player.connection': {
@@ -292,6 +325,7 @@
       const { players, state, ...info } = s;
       this.room = info;
       this.state = state || {};
+      this._optim = [];
       this.players = new Map(players.map((p) => [p.id, p]));
       this._emit('joined', this.room);
       this._emit('state', this.state, { ops: [], by: null, full: true });
@@ -321,13 +355,27 @@
 
     // ---------- shared state ----------
     /** Set shared room state at a dot-path. Applied on all clients (including you) once the server confirms. */
-    setState(path, value) { return this.request('state.set', { ops: [[path, value]] }); }
-    deleteState(path) { return this.request('state.set', { ops: [[path, null, 1]] }); }
+    setState(path, value) { return this._writeState([[path, value]]); }
+    deleteState(path) { return this._writeState([[path, null, 1]]); }
     /** Atomic batch: { 'a.b': 1, 'c': null-to-delete-use-deleteState } or array [[path, value, del?]] */
     batchState(ops) {
       const arr = Array.isArray(ops) ? ops : Object.entries(ops).map(([p, v]) => (v === undefined ? [p, null, 1] : [p, v]));
-      return this.request('state.set', { ops: arr });
+      return this._writeState(arr);
     }
+    _writeState(ops) {
+      if (!this.opts.optimistic || !this.room || !this.connected) return this.request('state.set', { ops });
+      // Client-side prediction: apply now (0 ms for you), reconcile with the server's ordering on echo.
+      for (const [p, v, del] of ops) setPath(this.state, p, v, !!del || v === undefined);
+      this._optim.push({ dirty: false });
+      this._emit('state', this.state, { ops, by: this.playerId, optimistic: true });
+      for (const [p, v] of ops) this._emit('state:' + String(p).split('.')[0], getPath(this.state, String(p).split('.')[0]), { path: p, value: v, by: this.playerId, optimistic: true });
+      return this.request('state.set', { ops }).catch((e) => {
+        this._optim.pop(); // rejected (e.g. not_host / server-authoritative): roll back to the server's truth
+        return this.resync().then(() => { throw e; }, () => { throw e; });
+      });
+    }
+    /** Re-fetch the authoritative room snapshot (used automatically after a rejected optimistic write). */
+    async resync() { if (!this.room) return; return this._applySnapshot(await this.request('join', { room: this.room.id })); }
     getState(path) { return getPath(this.state, path); }
 
     // ---------- per-player data ----------
@@ -338,8 +386,30 @@
       return this._fire('player.set', { data, replace });
     }
 
+    /**
+     * Dead reckoning for remote players: where `keys` (default x,y) probably are *now*, extrapolated from the
+     * velocity of their last two updates plus half your ping. Hides most of the network delay for smooth motion.
+     * Returns a plain object { x, y, ... }. For your own player it returns your local data unchanged.
+     */
+    predict(playerId, keys = ['x', 'y'], { maxAheadMs = 250 } = {}) {
+      const pl = this.players.get(playerId);
+      if (!pl) return null;
+      const out = {};
+      const s = this._samples.get(playerId);
+      for (const k of keys) out[k] = pl.data[k];
+      if (playerId === this.playerId || !s || !s.prev || !s.prevT) return out;
+      const dt = s.t - s.prevT;
+      if (dt <= 0 || dt > 1000) return out;
+      const ahead = Math.min(maxAheadMs, Date.now() - s.t + this.latency / 2);
+      for (const k of keys) {
+        const a = s.prev[k], b = s.cur[k];
+        if (typeof a === 'number' && typeof b === 'number') out[k] = b + ((b - a) / dt) * ahead;
+      }
+      return out;
+    }
+
     // ---------- messaging ----------
-    /** Send a message. to: undefined (everyone else) | 'all' | 'host' | playerId | [ids]. Outside a room, `to` must be a playerId (direct message). */
+    /** Send a message. to: undefined (everyone else) | 'all' | 'host' | 'server' (game's server script) | playerId | [ids]. Outside a room, `to` must be a playerId (direct message). */
     send(type, data, to, { self = false } = {}) { return this._fire('send', { type, data, to, self }); }
     /** Same as send but resolves when the server accepted it (rejects on error). */
     sendReliable(type, data, to, { self = false } = {}) { return this.request('send', { type, data, to, self }); }

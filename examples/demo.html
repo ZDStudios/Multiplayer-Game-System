@@ -77,9 +77,9 @@
       .map((p) => `<div><span style="color:${color(p.id)}">${p.id === mp.room.host ? '👑 ' : ''}${esc(p.name)}${p.connected ? '' : ' (away)'}</span><b>${s[p.id] || 0}</b></div>`).join('');
   });
 
-  await mp.connect();
   const want = params.get('room');
-  await (want ? mp.join(want, { maxPlayers: 12 }) : mp.quickJoin('arena', { maxPlayers: 12 }));
+  // connect + join in ONE round trip
+  await mp.connect(want ? { room: want, options: { maxPlayers: 12 } } : { quickJoin: 'arena', options: { maxPlayers: 12 } });
   mp.setPlayer({ x: W / 2, y: H / 2 });
 
   $('#joinBtn').onclick = () => $('#code').value && mp.join($('#code').value.trim().toUpperCase()).catch((e) => chat(`<i>${esc(e.message)}</i>`));
@@ -104,7 +104,7 @@
       const len = Math.hypot(dx, dy) || 1;
       x = Math.max(15, Math.min(W - 15, x + (dx / len) * 5)); y = Math.max(15, Math.min(H - 15, y + (dy / len) * 5));
       me.data.x = x; me.data.y = y;
-      if (t - lastSend > 50 && (dx || dy)) { lastSend = t; mp.setPlayer({ x: Math.round(x), y: Math.round(y) }); }
+      if (t - lastSend > 33 && (dx || dy)) { lastSend = t; mp.setPlayer({ x: Math.round(x), y: Math.round(y) }); }
       for (const [id, c] of Object.entries(mp.state.coins || {})) if (Math.hypot(x - c.x, y - c.y) < 30 && !c._asked) { c._asked = 1; mp.send('pickup', id, 'host', { self: true }); }
     }
     cv.width = cv.clientWidth * devicePixelRatio; cv.height = cv.clientHeight * devicePixelRatio;
@@ -115,7 +115,7 @@
     for (const p of mp.players.values()) {
       if (p.data.x == null) continue;
       let s = shown.get(p.id) || { x: p.data.x, y: p.data.y };
-      if (p.id === mp.playerId) s = { x: p.data.x, y: p.data.y }; else { s.x += (p.data.x - s.x) * 0.25; s.y += (p.data.y - s.y) * 0.25; }
+      if (p.id === mp.playerId) s = { x: p.data.x, y: p.data.y }; else { const g = mp.predict(p.id); s.x += (g.x - s.x) * 0.35; s.y += (g.y - s.y) * 0.35; } // dead reckoning hides network delay
       shown.set(p.id, s);
       ctx.globalAlpha = p.connected ? 1 : 0.35; ctx.fillStyle = color(p.id);
       ctx.beginPath(); ctx.arc(s.x, s.y, 15, 0, 7); ctx.fill();

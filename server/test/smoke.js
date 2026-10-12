@@ -121,6 +121,60 @@ try {
   await api('POST', `/games/${game.id}/players/${d.playerId}/unban`);
   await d.connect(); ok('unban restores access');
 
+  // ---- latency features ----
+  const o1 = new Multiplayer({ url: BASE, key: game.key });
+  await o1.connect({ room: 'OPTI' }); // pipelined join
+  assert.equal(o1.room && o1.room.id, 'OPTI'); ok('connect({room}) joins in the same round trip');
+  const o2 = new Multiplayer({ url: BASE, key: game.key }); await o2.connect({ room: 'OPTI' });
+  let evs = 0; o1.on('state', () => evs++);
+  const p1 = o1.setState('hp', 50);
+  assert.equal(o1.state.hp, 50); ok('optimistic setState applies locally before the server replies');
+  await p1; await waitFor(() => o2.state.hp === 50); await sleep(50);
+  assert.equal(evs, 1); ok('own echo is deduplicated (one state event)');
+  await o1.updateRoom({ stateWrite: 'host' }).catch(() => {});
+  if (!o2.isHost) { await assert.rejects(o2.setState('hp', 1)); assert.equal(o2.state.hp, 50); ok('rejected optimistic write rolls back'); }
+  await o1.updateRoom({ stateWrite: 'all' }).catch(() => {});
+  o2.setPlayer({ x: 0 }); await sleep(100); o2.setPlayer({ x: 10 });
+  await waitFor(() => o1.players.get(o2.playerId).data.x === 10);
+  assert.ok(o1.predict(o2.playerId, ['x']).x > 10); ok('predict() extrapolates remote motion');
+
+  const script = `
+    let loops = 0;
+    module.exports = {
+      authoritative: true, tickRate: 30,
+      onCreate(room) { room.setState('score', {}); room.data.ticks = 0; },
+      onJoin(room, p) { room.setState('score.' + p.id, 0); },
+      onMessage(room, p, type, data) {
+        if (type === 'hit') room.batchState([['score.' + p.id, room.getState('score.' + p.id) + data.dmg], ['last', p.id]]);
+        if (type === 'boom') throw new Error('kaboom');
+        if (type === 'hang') { while (true) loops++; }
+        if (type === 'ask') room.send('answer', 42, p.id);
+      },
+      onTick(room) { room.data.ticks++; if (room.data.ticks === 3) room.setState('ticked', true); },
+    };`;
+  assert.equal((await api('PUT', `/games/${game.id}/script`, { code: script })).body.loaded, true); ok('upload server script via admin API');
+  assert.equal((await api('PUT', `/games/${game.id}/script`, { code: 'module.exports = {' })).status, 400); ok('broken script rejected with 400');
+  await api('PUT', `/games/${game.id}/script`, { code: script });
+  const s1 = new Multiplayer({ url: BASE, key: game.key }); await s1.connect({ room: 'SRV' });
+  const s2 = new Multiplayer({ url: BASE, key: game.key }); await s2.connect({ room: 'SRV' });
+  await waitFor(() => s2.state.score && s2.state.score[s1.playerId] === 0 && s2.state.ticked === true); ok('onCreate/onJoin/onTick drive state');
+  s1.send('hit', { dmg: 7 }, 'server');
+  await waitFor(() => s2.state.score[s1.playerId] === 7 && s2.state.last === s1.playerId); ok('client -> server script -> everyone (1 round trip)');
+  await assert.rejects(s1.setState('score', 999), /authoritative/); ok('authoritative script blocks direct client writes');
+  const ans = new Promise((r) => s1.onMessage('answer', (d, from) => r([d, from])));
+  s1.send('ask', null, 'server');
+  assert.deepEqual(await ans, [42, 'server']); ok('script can message a player');
+  s1.send('boom', null, 'server'); s1.send('hang', null, 'server');
+  await sleep(300);
+  assert.ok((await s2.ping()) < 1000);
+  const info = (await api('GET', `/games/${game.id}/script`)).body;
+  assert.ok(info.errors.some((e) => /kaboom/.test(e.message)) && info.errors.some((e) => /timed out/i.test(e.message))); ok('script errors + infinite loops are contained (server stays up)');
+  await api('DELETE', `/games/${game.id}/script`);
+  await s1.setState('free', 1); ok('removing script restores client writes');
+  await sleep(5200);
+  assert.ok((await api('GET', '/overview')).body.players.some((p) => typeof p.rtt === 'number')); ok('server measures per-player RTT');
+  for (const x of [o1, o2, s1, s2]) x.disconnect();
+
   await api('PATCH', `/games/${game.id}`, { enabled: false });
   await waitFor(() => !e.connected); ok('disabling game disconnects clients');
 

@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { openDb } from './db.js';
+import { createScripting } from './scripts.js';
 
 const scrypt = promisify(crypto.scrypt);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -163,6 +164,7 @@ function broadcast(room, obj, exceptPid) {
   }
 }
 const pubPlayer = (m) => ({ id: m.id, name: m.name, data: m.data, connected: m.connected, joined: m.joined, username: m.username || null });
+const rttOf = (m) => (m.client ? m.client.rtt : null);
 const roomInfo = (r) => ({ id: r.id, host: r.host, meta: r.meta, maxPlayers: r.maxPlayers, locked: r.locked,
   private: r.private, tag: r.tag, stateWrite: r.stateWrite, hasPassword: !!r.password, created: r.created });
 const snapshot = (r) => ({ ...roomInfo(r), players: [...r.players.values()].map(pubPlayer), state: r.state });
@@ -182,6 +184,7 @@ function createRoom(game, id, o = {}) {
   }
   rooms.set(rkey(game.id, id), room);
   log(game.id, 'room', `Room ${id} created`);
+  if (scripts.has(game.id)) { scripts.call(room, 'onCreate'); scripts.startTick(room); }
   return room;
 }
 function destroyRoom(room, reason = 'empty') {
@@ -191,6 +194,7 @@ function destroyRoom(room, reason = 'empty') {
     if (m.client) { send(m.client, { t: 'left', room: room.id, reason }); m.client.room = null; }
   }
   room.players.clear();
+  scripts.stopTick(room);
   rooms.delete(rkey(room.game.id, room.id));
   log(room.game.id, 'room', `Room ${room.id} closed (${reason})`);
 }
@@ -210,6 +214,7 @@ function removeMember(room, pid, reason) {
   room.players.delete(pid);
   if (m.client && m.client.room === room) m.client.room = null;
   broadcast(room, { t: 'player.left', id: pid, reason });
+  scripts.call(room, 'onLeave', pubPlayer(m), reason);
   if (room.players.size === 0) return destroyRoom(room);
   pickHost(room);
 }
@@ -239,11 +244,15 @@ function joinRoom(c, id, o = {}) {
       connected: true, joined: Date.now(), client: c, graceTimer: null };
     room.players.set(c.pid, m);
     broadcast(room, { t: 'player.joined', player: pubPlayer(m) }, c.pid);
+    if (scripts.has(c.game.id)) { c.room = room; pickHost(room); scripts.call(room, 'onJoin', pubPlayer(m)); }
   }
   c.room = room;
   pickHost(room);
   return snapshot(room);
 }
+const scripts = createScripting({ log, broadcast, send, setPath, removeMember, pubPlayer, E });
+for (const g of games.values()) if (g.settings.script) scripts.load(g);
+
 function onDisconnect(c) {
   const room = c.room;
   if (!room) return;
@@ -348,6 +357,7 @@ const H = {
   'state.set'(c, m) {
     const r = needRoom(c);
     if (r.stateWrite === 'host' && r.host !== c.pid) throw new E('not_host', 'Room state is host-only');
+    if (scripts.authoritative(c.game.id)) throw new E('forbidden', 'Room state is server-authoritative; send an action to the server instead');
     let ops = m.ops;
     if (!Array.isArray(ops)) ops = [[m.path, m.value, m.del ? 1 : 0]];
     if (ops.length > 256) throw new E('too_many_ops');
@@ -382,6 +392,11 @@ const H = {
       return true;
     }
     const r = c.room;
+    if (to === 'server') {
+      if (!scripts.has(c.game.id)) throw new E('no_server_script', 'This game has no server script');
+      scripts.call(r, 'onMessage', pubPlayer(r.players.get(c.pid)), msg.type, msg.data);
+      return true;
+    }
     if (to == null || to === 'all') return broadcast(r, msg, m.self ? null : c.pid), true;
     const ids = to === 'host' ? [r.host] : Array.isArray(to) ? to.slice(0, 256) : [to];
     for (const id of ids) {
@@ -574,7 +589,8 @@ const gameSummary = (g, counts) => {
   for (const c of online.values()) if (c.game === g) on++;
   for (const r of rooms.values()) if (r.game === g) rc++;
   const st = gameStats.get(g.id);
-  return { id: g.id, name: g.name, key: g.key, enabled: g.enabled, created: g.created, settings: g.settings,
+  const { script, ...settings } = g.settings;
+  return { id: g.id, name: g.name, key: g.key, enabled: g.enabled, created: g.created, settings, hasScript: !!script, scriptOk: scripts.has(g.id),
     online: on, rooms: rc, totalPlayers: counts.get(g.id) || 0, msgRate: st.rate, peak: st.peak, lastActive: st.lastActive };
 };
 const trunc = (v, n = 20000) => { const s = JSON.stringify(v); return s.length > n ? s.slice(0, n) + '…(truncated)' : s; };
@@ -590,7 +606,7 @@ async function admin(req, res, parts, url) {
         connections: conns.size, online: online.size, rooms: rooms.size, msgIn: stats.in, msgOut: stats.out,
         bytesIn: stats.bytesIn, bytesOut: stats.bytesOut, openGames: CFG.openGames },
       players: [...online.values()].slice(0, 500).map((c) => ({ game: c.game.id, gameName: c.game.name, id: c.pid, name: c.name,
-        username: c.username, room: c.room ? c.room.id : null, since: c.since })),
+        username: c.username, room: c.room ? c.room.id : null, since: c.since, rtt: c.rtt })),
       history: stats.history, games: [...games.values()].map((g) => gameSummary(g, counts)), events: events.slice(-100).reverse(),
     });
   }
@@ -629,7 +645,7 @@ async function admin(req, res, parts, url) {
     return json(res, 200, {
       ...gameSummary(g, counts), accounts: S.accCount.get(g.id).n, kvEntries: S.kvCount.get(g.id).n,
       rooms: [...rooms.values()].filter((r) => r.game === g).map((r) => ({ ...roomInfo(r), persist: r.persist,
-        players: [...r.players.values()].map(pubPlayer).map((p) => ({ ...p, data: trunc(p.data, 2000) })), state: trunc(r.state) })),
+        players: [...r.players.values()].map((m) => ({ ...pubPlayer(m), rtt: rttOf(m), data: trunc(m.data, 2000) })), state: trunc(r.state) })),
       recentPlayers: S.playersRecent.all(g.id, 50).map((p) => ({ ...p, online: online.has(rkey(g.id, p.id)) })),
       leaderboards: S.scoreBoards.all(g.id),
     });
@@ -651,6 +667,21 @@ async function admin(req, res, parts, url) {
       r.state = safeMerge({}, b.state);
       broadcast(r, { t: 'state', ops: [], full: r.state, by: 'server' });
       return json(res, 200, { ok: true });
+    }
+  }
+  if (sub === 'script') {
+    if (method === 'GET') return json(res, 200, { code: g.settings.script || '', ...scripts.info(g.id) });
+    if (method === 'PUT' || method === 'DELETE') {
+      const b = method === 'PUT' ? await readBody(req) : {};
+      const code = method === 'PUT' ? String(b.code ?? '') : '';
+      if (code.length > 512 * 1024) throw new E('too_large');
+      g.settings.script = code || undefined;
+      saveGame(g);
+      for (const r of rooms.values()) if (r.game === g) { scripts.stopTick(r); r.api = null; }
+      const s = code ? scripts.load(g) : (scripts.unload(g.id), null);
+      if (s && !s.failed) for (const r of rooms.values()) if (r.game === g) scripts.startTick(r);
+      log(g.id, 'admin', code ? 'Server script updated' : 'Server script removed');
+      return json(res, s && s.failed ? 400 : 200, scripts.info(g.id));
     }
   }
   if (sub === 'players' && sid && method === 'POST') {
@@ -738,15 +769,16 @@ const server = http.createServer(async (req, res) => {
 
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: CFG.maxMsg * 2 });
 wss.on('connection', (ws, req) => {
+  req.socket.setNoDelay(true);
   const ip = clientIp(req);
   const n = (ipConns.get(ip) || 0) + 1;
   if (n > CFG.maxConnsPerIp) return ws.close(4029, 'too_many_connections');
   ipConns.set(ip, n);
   const c = { ws, ip, origin: req.headers.origin || '', game: null, pid: null, name: '', username: null, room: null,
-    tokens: CFG.burst, lastRefill: Date.now(), dropped: 0, lastWarn: 0, loginFails: 0, alive: true, since: Date.now() };
+    tokens: CFG.burst, lastRefill: Date.now(), dropped: 0, lastWarn: 0, loginFails: 0, alive: true, missed: 0, rtt: null, pingAt: 0, since: Date.now() };
   c.helloTimer = setTimeout(() => !c.game && ws.close(4008, 'hello_timeout'), 10000);
   conns.add(c);
-  ws.on('pong', () => { c.alive = true; });
+  ws.on('pong', () => { c.alive = true; if (c.pingAt) { c.rtt = Date.now() - c.pingAt; c.pingAt = 0; } });
   ws.on('message', (raw, bin) => onMessage(c, raw.toString(), bin));
   ws.on('close', () => {
     clearTimeout(c.helloTimer);
@@ -761,10 +793,11 @@ wss.on('connection', (ws, req) => {
 });
 setInterval(() => {
   for (const c of conns) {
-    if (!c.alive) { c.ws.terminate(); continue; }
-    c.alive = false; c.ws.ping();
+    if (!c.alive && ++c.missed >= 5) { c.ws.terminate(); continue; }
+    if (c.alive) c.missed = 0;
+    c.alive = false; c.pingAt = Date.now(); c.ws.ping();
   }
-}, 25000).unref();
+}, 5000).unref(); // also measures each client's RTT (shown in the dashboard)
 
 server.listen(CFG.port, () => {
   console.log(`[mp] listening on :${CFG.port}  (ws path /ws, dashboard /, sdk /sdk.js, data ${CFG.dataDir})`);

@@ -4,6 +4,8 @@ A self-hosted, game-agnostic multiplayer backend. One Docker stack on your VPS g
 
 - **Realtime rooms**: share codes, matchmaking (`quickJoin`), host election and migration, kick/ban, locking, passwords, reconnects that keep the player's slot.
 - **Three sync channels**: ordered shared room state, per-player data, and relay messages (to everyone, the host, or specific players, plus DMs).
+- **Server scripts**: optional authoritative game logic per game, edited in the dashboard. Each hook call has a CPU limit, and a script that crashes or loops forever is stopped without taking the server down. An action costs 1 round trip instead of 2 through a host client.
+- **Low latency**: optimistic state, dead-reckoning `predict()`, connect and join in one round trip, per-player ping in the dashboard, and kernel tuning (`tune-network.sh`).
 - **Persistence (SQLite)**: per-player, private and game-wide key/value storage, atomic counters, persistent rooms, leaderboards, username/password accounts.
 - **Admin**: one-click shut down / start per game, kick or ban any online player, plus a dashboard (static HTML that runs on GitHub Pages or from the server itself) with live traffic, games, rooms, players, storage browser, leaderboards and broadcasts.
 - **Security**: per-game public keys, an admin bearer token, HMAC-signed player tokens, scrypt passwords, rate limits, message size caps, origin allow-lists, auto-HTTPS via Caddy.
@@ -54,6 +56,14 @@ docker compose logs -f mp                 # logs
 docker compose up -d --build              # update after git pull
 docker compose exec mp cat /data/mp.db > backup.db   # or back up the mp-data volume
 ```
+
+## Latency tuning
+
+```bash
+sudo sh tune-network.sh      # BBR + fq, low TCP send buffering, no slow-start after idle (persists across reboots)
+```
+
+The biggest factor is the network path between players and the VPS. Check the **Ping** column in the dashboard. If players are far from the server or their ISP routes badly, put the domain behind **Cloudflare** (proxied DNS record; WebSockets work on the free plan). Cloudflare's backbone often beats ISP routing. Measured from Perth to the Kuala Lumpur VPS: **314 ms direct vs 239 ms through Cloudflare**. Hosting the VPS in the same region as your players matters most of all.
 
 ## Dashboard on GitHub Pages
 
