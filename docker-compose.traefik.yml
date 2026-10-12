@@ -1,0 +1,30 @@
+# Use this instead of the bundled Caddy when something else already owns ports 80/443,
+# e.g. a Coolify server (its Traefik proxy handles HTTPS and routes by Host).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d --build
+#
+# DOMAIN in .env must point at the server (A record). Caddy is moved to an opt-in profile.
+services:
+  mp:
+    networks: [default, coolify]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=coolify
+      - traefik.http.routers.mp-http.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.mp-http.entrypoints=http
+      - traefik.http.routers.mp-http.middlewares=mp-redirect
+      - traefik.http.middlewares.mp-redirect.redirectscheme.scheme=https
+      - traefik.http.routers.mp.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.mp.entrypoints=https
+      - traefik.http.routers.mp.tls=true
+      - traefik.http.routers.mp.tls.certresolver=letsencrypt
+      - traefik.http.routers.mp.middlewares=mp-gzip
+      - traefik.http.middlewares.mp-gzip.compress=true
+      - traefik.http.services.mp.loadbalancer.server.port=8080
+
+  caddy:
+    profiles: [caddy]
+
+networks:
+  coolify:
+    external: true
