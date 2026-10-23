@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { openDb } from './db.js';
 import { createScripting } from './scripts.js';
+import { createTransports } from './transports.js';
 
 const scrypt = promisify(crypto.scrypt);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -28,6 +29,14 @@ const CFG = {
   grace: +env.RECONNECT_GRACE_MS || 15000,
   maxRoomPlayers: +env.MAX_ROOM_PLAYERS || 256,
   maxConnsPerIp: +env.MAX_CONNS_PER_IP || 50,
+  // Extra transports next to the WebSocket (see transports.js). UDP_PORT=0 / WEBRTC=false turn them off.
+  udpPort: env.UDP_PORT === '0' ? 0 : +env.UDP_PORT || 8081,
+  udpBind: env.UDP_BIND || '',
+  rtc: env.WEBRTC !== 'false',
+  rtcPort: +env.RTC_PORT || 0,          // one UDP port for every WebRTC peer (ICE UDP mux); 0 = random ports
+  publicIp: env.PUBLIC_IP || '',        // advertised in WebRTC candidates (needed inside Docker)
+  publicHost: env.UDP_HOST || '',       // host clients send UDP to; default = the host they connected to
+  iceServers: (env.ICE_SERVERS || '').split(',').map((v) => v.trim()).filter(Boolean),
 };
 
 // ---------- storage / secrets ----------
@@ -151,18 +160,20 @@ const newCode = (gid) => {
   }
 };
 
-function send(c, obj) {
-  if (!c || c.ws.readyState !== 1) return;
-  const s = JSON.stringify(obj);
-  c.ws.send(s);
+// unreliable = fast lane (may drop, never resent); only matters for v2 clients on a WebRTC/UDP link.
+function out(c, s, unreliable) {
+  if (c.session) c.session.send(s, unreliable); else c.ws.send(s);
   stats.out++; stats.bytesOut += s.length;
 }
-function broadcast(room, obj, exceptPid) {
+function send(c, obj, unreliable) {
+  if (!c || c.ws.readyState !== 1) return;
+  out(c, JSON.stringify(obj), unreliable);
+}
+function broadcast(room, obj, exceptPid, unreliable) {
   const s = JSON.stringify(obj);
   for (const m of room.players.values()) {
     if (m.id === exceptPid || !m.client || m.client.ws.readyState !== 1) continue;
-    m.client.ws.send(s);
-    stats.out++; stats.bytesOut += s.length;
+    out(m.client, s, unreliable);
   }
 }
 const pubPlayer = (m) => ({ id: m.id, name: m.name, data: m.data, connected: m.connected, joined: m.joined, username: m.username || null });
@@ -374,15 +385,20 @@ const H = {
     broadcast(r, { t: 'state', ops: out, by: c.pid });
     return true;
   },
-  'player.set'(c, m) {
+  'player.set'(c, m, unreliable) {
     const r = needRoom(c);
     const mem = r.players.get(c.pid);
     if (!isObj(m.data)) throw new E('bad_data');
+    // Fast-lane snapshots carry a sequence number: a late or duplicate one must not roll the data back.
+    const seq = m.s != null && Number.isFinite(+m.s) ? +m.s : null;
+    if (seq != null) { if (seq <= (mem.pseq || 0)) return true; mem.pseq = seq; }
     if (m.replace) mem.data = safeMerge({}, m.data); else safeMerge(mem.data, m.data);
-    broadcast(r, { t: 'player', id: c.pid, data: m.data, replace: !!m.replace }, c.pid);
+    const msg = { t: 'player', id: c.pid, data: m.data, replace: !!m.replace };
+    if (seq != null) msg.s = seq;
+    broadcast(r, msg, c.pid, unreliable);
     return true;
   },
-  send(c, m) {
+  send(c, m, unreliable) {
     const msg = { t: 'msg', type: str(m.type, 64, 'message'), data: m.data ?? null, from: c.pid };
     const to = m.to;
     if (!c.room) { // direct message to any online player of the game
@@ -390,7 +406,7 @@ const H = {
       const target = online.get(rkey(c.game.id, to));
       if (!target) throw new E('player_offline');
       msg.direct = true;
-      send(target, msg);
+      send(target, msg, unreliable);
       return true;
     }
     const r = c.room;
@@ -399,11 +415,11 @@ const H = {
       scripts.call(r, 'onMessage', pubPlayer(r.players.get(c.pid)), msg.type, msg.data);
       return true;
     }
-    if (to == null || to === 'all') return broadcast(r, msg, m.self ? null : c.pid), true;
+    if (to == null || to === 'all') return broadcast(r, msg, m.self ? null : c.pid, unreliable), true;
     const ids = to === 'host' ? [r.host] : Array.isArray(to) ? to.slice(0, 256) : [to];
     for (const id of ids) {
       const t = r.players.get(String(id));
-      if (t && t.client) send(t.client, msg);
+      if (t && t.client) send(t.client, msg, unreliable);
     }
     return true;
   },
@@ -517,12 +533,19 @@ function hello(c, m) {
   S.playerTouch.run(game.id, pid, c.name, Date.now(), Date.now());
   gameStats.get(game.id).lastActive = Date.now();
   send(c, { t: 'welcome', playerId: pid, token: makeToken(game.id, pid), name: c.name, username: c.username,
-    serverTime: Date.now(), game: { id: game.id, name: game.name }, returning: !!row });
+    serverTime: Date.now(), game: { id: game.id, name: game.name }, returning: !!row,
+    transports: c.session ? net.offer(c) : undefined });
   if (!row) log(game.id, 'player', `New player ${c.name}`);
 }
 
-async function onMessage(c, raw, isBinary) {
-  if (isBinary || raw.length > CFG.maxMsg) return send(c, { t: 'error', code: 'too_large' });
+// v1 (legacy) clients: one bare JSON message per WebSocket frame.
+function onLegacyMessage(c, raw) {
+  let m;
+  try { m = JSON.parse(raw); } catch { return send(c, { t: 'error', code: 'bad_json' }); }
+  onMessage(c, m, raw.length, false);
+}
+// One application message, from any transport. unreliable = it came on the fast lane.
+async function onMessage(c, m, size, unreliable) {
   // token bucket
   const now = Date.now();
   c.tokens = Math.min(CFG.burst, c.tokens + ((now - c.lastRefill) / 1000) * CFG.rate);
@@ -533,9 +556,7 @@ async function onMessage(c, raw, isBinary) {
     return;
   }
   c.tokens--;
-  stats.in++; stats.bytesIn += raw.length;
-  let m;
-  try { m = JSON.parse(raw); } catch { return send(c, { t: 'error', code: 'bad_json' }); }
+  stats.in++; stats.bytesIn += size;
   if (!isObj(m)) return;
   if (!c.game) {
     if (m.t !== 'hello') return c.ws.close(4000, 'hello_required');
@@ -547,7 +568,7 @@ async function onMessage(c, raw, isBinary) {
   const fn = Object.hasOwn(H, m.t) ? H[m.t] : null;
   try {
     if (!fn) throw new E('unknown_type', `Unknown message type: ${m.t}`);
-    const result = await fn(c, m);
+    const result = await fn(c, m, unreliable);
     if (m.rid != null) send(c, { t: 'res', rid: m.rid, ok: true, d: result === undefined ? null : result });
   } catch (e) {
     if (!(e instanceof E)) console.error('[mp] handler error', m.t, e);
@@ -606,9 +627,9 @@ async function admin(req, res, parts, url) {
     return json(res, 200, {
       server: { uptime: Date.now() - started, started, node: process.version, rss: mem.rss, heap: mem.heapUsed,
         connections: conns.size, online: online.size, rooms: rooms.size, msgIn: stats.in, msgOut: stats.out,
-        bytesIn: stats.bytesIn, bytesOut: stats.bytesOut, openGames: CFG.openGames },
+        bytesIn: stats.bytesIn, bytesOut: stats.bytesOut, openGames: CFG.openGames, transports: net.info() },
       players: [...online.values()].slice(0, 500).map((c) => ({ game: c.game.id, gameName: c.game.name, id: c.pid, name: c.name,
-        username: c.username, room: c.room ? c.room.id : null, since: c.since, rtt: c.rtt })),
+        username: c.username, room: c.room ? c.room.id : null, since: c.since, rtt: c.rtt, transport: net.active(c) })),
       history: stats.history, games: [...games.values()].map((g) => gameSummary(g, counts)), events: events.slice(-100).reverse(),
     });
   }
@@ -647,7 +668,7 @@ async function admin(req, res, parts, url) {
     return json(res, 200, {
       ...gameSummary(g, counts), accounts: S.accCount.get(g.id).n, kvEntries: S.kvCount.get(g.id).n,
       rooms: [...rooms.values()].filter((r) => r.game === g).map((r) => ({ ...roomInfo(r), persist: r.persist,
-        players: [...r.players.values()].map((m) => ({ ...pubPlayer(m), rtt: rttOf(m), data: trunc(m.data, 2000) })), state: trunc(r.state) })),
+        players: [...r.players.values()].map((m) => ({ ...pubPlayer(m), rtt: rttOf(m), transport: m.client ? net.active(m.client) : null, data: trunc(m.data, 2000) })), state: trunc(r.state) })),
       recentPlayers: S.playersRecent.all(g.id, 50).map((p) => ({ ...p, online: online.has(rkey(g.id, p.id)) })),
       leaderboards: S.scoreBoards.all(g.id),
     });
@@ -769,6 +790,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+const net = await createTransports(CFG, { deliver: (c, m, unreliable) => onMessage(c, m, 0, unreliable), log, onBytes: (n) => { stats.bytesIn += n; } });
+
 // perMessageDeflate off: compressing many tiny frames costs CPU + latency and saves almost nothing.
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: CFG.maxMsg * 2, perMessageDeflate: false });
 wss.on('connection', (ws, req) => {
@@ -782,10 +805,17 @@ wss.on('connection', (ws, req) => {
   c.helloTimer = setTimeout(() => !c.game && ws.close(4008, 'hello_timeout'), 10000);
   conns.add(c);
   ws.on('pong', () => { c.alive = true; if (c.pingAt) { c.rtt = Date.now() - c.pingAt; c.pingAt = 0; } });
-  ws.on('message', (raw, bin) => onMessage(c, raw.toString(), bin));
+  ws.on('message', (raw, bin) => {
+    if (bin || raw.length > CFG.maxMsg) return send(c, { t: 'error', code: 'too_large' });
+    const s = raw.toString();
+    // v2 clients wrap everything in session frames (the first is always {"q":1,...}); v1 sends bare messages.
+    if (!c.session && !c.legacy) { if (s.startsWith('{"q":')) net.attach(c); else c.legacy = true; }
+    if (c.session) net.onFrame(c, c.links.websocket, s); else onLegacyMessage(c, s);
+  });
   ws.on('close', () => {
     clearTimeout(c.helloTimer);
     conns.delete(c);
+    net.detach(c);
     const left = (ipConns.get(ip) || 1) - 1;
     if (left) ipConns.set(ip, left); else ipConns.delete(ip);
     if (!c.game) return;
@@ -803,7 +833,9 @@ setInterval(() => {
 }, 5000).unref(); // also measures each client's RTT (shown in the dashboard)
 
 server.listen(CFG.port, () => {
+  const t = net.info();
   console.log(`[mp] listening on :${CFG.port}  (ws path /ws, dashboard /, sdk /sdk.js, data ${CFG.dataDir})`);
+  console.log(`[mp] transports: websocket, webrtc ${t.webrtc ? 'on' + (t.rtcPort ? ' (udp ' + t.rtcPort + ')' : '') : 'off'}, udp ${t.udp ? 'on :' + t.udp : 'off'}`);
   log(null, 'server', 'Server started');
 });
 
@@ -811,6 +843,7 @@ function shutdown() {
   console.log('[mp] shutting down');
   for (const r of [...rooms.values()]) if (r.persist) S.kvSet.run(r.game.id, 'room', r.id, 'state', JSON.stringify(r.state), Date.now());
   for (const c of conns) c.ws.close(1012, 'server_restart');
+  net.close();
   server.close();
   store.close();
   setTimeout(() => process.exit(0), 300);

@@ -5,16 +5,18 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import { RTCPeerConnection } from 'node-datachannel/polyfill';
 
 const require = createRequire(import.meta.url);
 const Multiplayer = require('../../client/multiplayer.js');
 const PORT = 18000 + Math.floor(Math.random() * 1000);
+const UDP_PORT = PORT + 1000, RTC_PORT = PORT + 2000;
 const BASE = `http://127.0.0.1:${PORT}`;
 const ADMIN = 'test_admin_token_1234567890';
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mp-'));
 const proc = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', 'src/index.js'], {
   cwd: path.resolve(import.meta.dirname, '..'),
-  env: { ...process.env, PORT, DATA_DIR: dir, ADMIN_TOKEN: ADMIN, RECONNECT_GRACE_MS: '800' },
+  env: { ...process.env, PORT, DATA_DIR: dir, ADMIN_TOKEN: ADMIN, RECONNECT_GRACE_MS: '800', UDP_PORT, RTC_PORT },
   stdio: ['ignore', 'inherit', 'inherit'],
 });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -22,7 +24,7 @@ const api = async (method, p, body, token = ADMIN) => {
   const r = await fetch(BASE + '/api/admin' + p, { method, headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' }, body: body && JSON.stringify(body) });
   return { status: r.status, body: await r.json() };
 };
-const waitFor = async (fn, ms = 2000) => { const t = Date.now(); while (!fn()) { if (Date.now() - t > ms) throw new Error('waitFor timeout: ' + fn); await sleep(20); } };
+const waitFor = async (fn, ms = 2000) => { const t = Date.now(); while (!(await fn())) { if (Date.now() - t > ms) throw new Error('waitFor timeout: ' + fn); await sleep(20); } };
 let n = 0;
 const ok = (msg) => console.log(`  ok ${++n}. ${msg}`);
 
@@ -174,6 +176,63 @@ try {
   await sleep(5200);
   assert.ok((await api('GET', '/overview')).body.players.some((p) => typeof p.rtt === 'number')); ok('server measures per-player RTT');
   for (const x of [o1, o2, s1, s2]) x.disconnect();
+
+  // ---- transports ----
+  const tw = new Multiplayer({ url: BASE, key: game.key, transports: ['websocket'] });
+  await tw.connect({ room: 'NET' });
+  assert.equal(tw.transport, 'websocket'); ok('transports: [websocket] stays on WebSocket');
+  const tu = new Multiplayer({ url: `http://localhost:${PORT}`, key: game.key, transports: ['udp', 'websocket'] }); // localhost -> ::1 in Node: exercises dual-stack UDP
+  await tu.connect({ room: 'NET' });
+  await waitFor(() => tu.transport === 'udp', 4000); ok('Node client probes and moves to raw UDP');
+  const tr = new Multiplayer({ url: BASE, key: game.key, transports: ['webrtc', 'websocket'], RTCPeerConnection });
+  await tr.connect({ room: 'NET' });
+  await waitFor(() => tr.transport === 'webrtc', 8000); ok('client probes and moves to WebRTC data channels');
+  const st = tr.transportStats;
+  assert.ok(st.webrtc.samples >= 3 && st.websocket.samples >= 1); ok('transportStats measures every link');
+  const ov2 = (await api('GET', '/overview')).body;
+  const kinds = new Set(ov2.players.filter((p) => [tu, tr].some((x) => x.playerId === p.id)).map((p) => p.transport));
+  assert.deepEqual([...kinds].sort(), ['udp', 'webrtc']); ok('server sends on the link each client chose (admin overview)');
+
+  await tu.setState('via', 'udp');
+  await waitFor(() => tr.state.via === 'udp' && tw.state.via === 'udp');
+  await tr.setState('via', 'rtc');
+  await waitFor(() => tu.state.via === 'rtc' && tw.state.via === 'rtc'); ok('state syncs across udp / webrtc / websocket clients');
+  const gotU = new Promise((r) => tu.onMessage('hey', r));
+  tr.send('hey', 1, tu.playerId);
+  assert.equal(await gotU, 1); ok('relay message webrtc -> udp');
+
+  tr.setPlayer({ x: 1 }, { unreliable: true });
+  for (let i = 2; i <= 30; i++) tr.setPlayer({ x: i }, { unreliable: true });
+  await waitFor(() => tu.players.get(tr.playerId).data.x === 30 && tw.players.get(tr.playerId).data.x === 30); ok('unreliable setPlayer lands on the newest value');
+
+  // 30% packet loss both ways on the UDP link: every reliable op must still arrive, in order.
+  const ul = tu._links.get('udp'), sendU = ul.send, frameU = tu._onFrame.bind(tu);
+  ul.send = (f, un) => (Math.random() < 0.3 ? undefined : sendU(f, un));
+  tu._onFrame = (l, d) => (l === ul && Math.random() < 0.3 ? undefined : frameU(l, d));
+  const order = [];
+  tw.on('state', (s, ev) => { for (const [p, v] of ev.ops || []) if (p === 'seq') order.push(v); });
+  for (let i = 1; i <= 60; i++) tu.setState('seq', i).catch(() => {});
+  await waitFor(() => tw.state.seq === 60 && tu.state.seq === 60, 8000);
+  assert.deepEqual(order, Array.from({ length: 60 }, (_, i) => i + 1)); ok('30% UDP loss: all 60 reliable writes delivered once, in order');
+  ul.send = sendU; tu._onFrame = frameU;
+
+  // Kill the UDP path entirely: the client must fall back to WebSocket without losing messages.
+  const back = new Promise((r) => tu.on('transport', (k) => k === 'websocket' && r()));
+  ul.send = () => {}; tu._onFrame = (l, d) => (l === ul ? undefined : frameU(l, d));
+  for (let i = 61; i <= 70; i++) tu.setState('seq', i).catch(() => {});
+  await back;
+  await waitFor(() => tw.state.seq === 70 && tu.state.seq === 70, 6000); ok('dead UDP link -> automatic fallback to WebSocket, nothing lost');
+  tu._onFrame = frameU;
+
+  // v1 clients (raw JSON over WebSocket, no session frames) keep working.
+  const legacy = await new Promise((resolve, reject) => {
+    const ws = new WebSocket(BASE.replace('http', 'ws') + '/ws');
+    ws.onopen = () => ws.send(JSON.stringify({ t: 'hello', v: 1, key: game.key }));
+    ws.onmessage = (ev) => { resolve(JSON.parse(ev.data)); ws.close(); };
+    ws.onerror = reject;
+  });
+  assert.equal(legacy.t, 'welcome'); assert.equal(legacy.transports, undefined); ok('legacy v1 clients still served over plain WebSocket');
+  for (const x of [tw, tu, tr]) x.disconnect();
 
   await api('PATCH', `/games/${game.id}`, { enabled: false });
   await waitFor(() => !e.connected); ok('disabling game disconnects clients');
