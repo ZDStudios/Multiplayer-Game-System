@@ -21,8 +21,10 @@ const CFG = {
   openGames: env.OPEN_GAMES === 'true',
   trustProxy: env.TRUST_PROXY === 'true',
   maxMsg: +env.MAX_MSG_BYTES || 64 * 1024,
-  rate: +env.RATE_LIMIT || 60,          // sustained msgs/sec per connection
-  burst: +env.RATE_BURST || 200,        // bucket size
+  // A 50 Hz game sends several messages per tick (player.set + state.set + send ...), so allow 200/s sustained
+  // (= 50 ticks x 4 msgs) with a 500 burst. Override with RATE_LIMIT / RATE_BURST.
+  rate: +env.RATE_LIMIT || 200,          // sustained msgs/sec per connection
+  burst: +env.RATE_BURST || 500,         // bucket size
   grace: +env.RECONNECT_GRACE_MS || 15000,
   maxRoomPlayers: +env.MAX_ROOM_PLAYERS || 256,
   maxConnsPerIp: +env.MAX_CONNS_PER_IP || 50,
@@ -767,7 +769,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-const wss = new WebSocketServer({ server, path: '/ws', maxPayload: CFG.maxMsg * 2 });
+// perMessageDeflate off: compressing many tiny frames costs CPU + latency and saves almost nothing.
+const wss = new WebSocketServer({ server, path: '/ws', maxPayload: CFG.maxMsg * 2, perMessageDeflate: false });
 wss.on('connection', (ws, req) => {
   req.socket.setNoDelay(true);
   const ip = clientIp(req);

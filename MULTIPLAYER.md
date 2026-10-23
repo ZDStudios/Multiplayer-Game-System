@@ -200,7 +200,7 @@ Each game can have **one server script**: a CommonJS module that runs on the ser
 ```js
 module.exports = {
   authoritative: true,   // clients can't setState in this game's rooms; only the script writes state
-  tickRate: 20,          // onTick calls per second (1–60). Omit for no tick loop.
+  tickRate: 50,          // onTick calls per second (1–60). Default 50 when onTick is defined.
 
   onCreate(room) {},                        // new room; initialize room.state here
   onJoin(room, player) {},                  // player = {id, name, data, connected, joined, username}

@@ -5,7 +5,7 @@
 // Script shape (CommonJS):
 //   module.exports = {
 //     authoritative: true,      // clients may not write room state directly (only the script can)
-//     tickRate: 20,             // onTick calls per second (0/omitted = no tick loop)
+//     tickRate: 50,             // onTick calls per second, 1-60 (default 50 when onTick is defined)
 //     onCreate(room) {}, onJoin(room, player) {}, onLeave(room, player, reason) {},
 //     onMessage(room, player, type, data) {},   // client: mp.send(type, data, 'server')
 //     onTick(room, dtSeconds) {},
@@ -15,6 +15,7 @@ import vm from 'node:vm';
 const HOOK_TIMEOUT_MS = 50;   // a single hook call may not block the event loop longer than this
 const LOAD_TIMEOUT_MS = 1000;
 const MAX_TICK_RATE = 60;
+const DEFAULT_TICK_RATE = Math.min(MAX_TICK_RATE, Math.max(1, +process.env.DEFAULT_TICK_RATE || 50));
 
 export function createScripting(h) {
   const { log, broadcast, send, setPath, removeMember, pubPlayer, E } = h;
@@ -115,7 +116,7 @@ export function createScripting(h) {
   function startTick(room) {
     stopTick(room);
     const s = get(room.game.id);
-    const rate = s && typeof s.mod.onTick === 'function' ? Math.min(MAX_TICK_RATE, Math.max(1, +s.mod.tickRate || 20)) : 0;
+    const rate = s && typeof s.mod.onTick === 'function' ? Math.min(MAX_TICK_RATE, Math.max(1, +s.mod.tickRate || DEFAULT_TICK_RATE)) : 0;
     if (!rate) return;
     let last = performance.now();
     room.tickTimer = setInterval(() => {
