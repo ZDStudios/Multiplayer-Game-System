@@ -5,6 +5,7 @@ A self-hosted, game-agnostic multiplayer backend. One Docker stack on your VPS g
 - **Realtime rooms**: share codes, matchmaking (`quickJoin`), host election and migration, kick/ban, locking, passwords, reconnects that keep the player's slot.
 - **Three sync channels**: ordered shared room state, per-player data, and relay messages (to everyone, the host, or specific players, plus DMs).
 - **Server scripts**: optional authoritative game logic per game, edited in the dashboard. Each hook call has a CPU limit, and a script that crashes or loops forever is stopped without taking the server down. An action costs 1 round trip instead of 2 through a host client.
+- **Best-link transports**: clients connect over WebSocket, then measure WebRTC data channels (browsers) and raw UDP (native/Node) in the background and move all traffic to the fastest link. If that link degrades or dies they switch again, with nothing lost or reordered. There's also an unreliable fast lane for movement.
 - **Low latency**: optimistic state, dead-reckoning `predict()`, connect and join in one round trip, per-player ping in the dashboard, and kernel tuning (`tune-network.sh`).
 - **Persistence (SQLite)**: per-player, private and game-wide key/value storage, atomic counters, persistent rooms, leaderboards, username/password accounts.
 - **Admin**: one-click shut down / start per game, kick or ban any online player, plus a dashboard (static HTML that runs on GitHub Pages or from the server itself) with live traffic, games, rooms, players, storage browser, leaderboards and broadcasts.
@@ -36,9 +37,9 @@ git clone <your-repo-url> mp && cd mp       # or scp this folder up
 sh deploy.sh
 ```
 
-`deploy.sh` installs Docker if it's missing and creates `.env` with a random `ADMIN_TOKEN`. It sets `DOMAIN=<ip-with-dashes>.sslip.io`, a free hostname that resolves to your IP, so HTTPS works without buying a domain. It then opens ports 80 and 443 in ufw and runs `docker compose up -d --build`. To use your own domain, point an A record at the VPS, set `DOMAIN=` in `.env`, and run `docker compose up -d`.
+`deploy.sh` installs Docker if it's missing and creates `.env` with a random `ADMIN_TOKEN`. It sets `DOMAIN=<ip-with-dashes>.sslip.io`, a free hostname that resolves to your IP, so HTTPS works without buying a domain. It also records the VPS's public IP as `PUBLIC_IP` (WebRTC advertises it to browsers). It then opens ports 80, 443, 8081/udp and 8082/udp in ufw and runs `docker compose up -d --build`. To use your own domain, point an A record at the VPS, set `DOMAIN=` in `.env`, and run `docker compose up -d`.
 
-Make sure ports 80 and 443 are open in the Hostinger panel firewall too.
+Make sure ports 80 and 443 (TCP) and 8081 and 8082 (UDP) are open in the Hostinger panel firewall too. UDP goes straight to the container, not through Caddy/Traefik. If those UDP ports are blocked, everything still works over WebSocket.
 
 | URL | What it is |
 |---|---|
@@ -46,7 +47,9 @@ Make sure ports 80 and 443 are open in the Hostinger panel firewall too.
 | `https://DOMAIN/demo` | Demo game. Open it from a game's page in the dashboard so the key is filled in. |
 | `https://DOMAIN/sdk.js` | Client SDK |
 | `https://DOMAIN/MULTIPLAYER.md` | Integration guide |
-| `wss://DOMAIN/ws` | WebSocket endpoint |
+| `wss://DOMAIN/ws` | WebSocket endpoint (signalling + fallback) |
+| `udp://DOMAIN:8081` | Raw UDP link for native/Node clients |
+| `udp://DOMAIN:8082` | WebRTC data channels (all peers multiplexed on one port) |
 | `https://DOMAIN/health` | Health check |
 
 Operations:
@@ -57,13 +60,31 @@ docker compose up -d --build              # update after git pull
 docker compose exec mp cat /data/mp.db > backup.db   # or back up the mp-data volume
 ```
 
+## Moving to another server (e.g. closer to your players)
+
+Latency is mostly distance plus routing, so host where your players are. Measured from Perth: Sydney ~51 ms, Melbourne ~59 ms, Singapore ~179 ms, Kuala Lumpur ~182 ms. For players all over Australia, **Sydney** is the best single location. Any Linux VPS with a public IPv4 works (x64 or arm64, 1 vCPU / 1 GB is plenty to start), with Ubuntu 22.04 or 24.04.
+
+1. Create the VPS in the provider's panel. In its firewall, allow TCP 22, 80 and 443, and UDP 443, 8081 and 8082.
+2. On the new server, let it SSH into the old one:
+   `ssh-keygen -t ed25519 && ssh-copy-id root@OLD_IP`
+3. On the new server, run:
+   ```bash
+   git clone <your-repo-url> mp && cd mp
+   sh migrate.sh root@OLD_IP
+   ```
+   This installs Docker, then copies the database and the admin token. Game keys, player identities, accounts, storage and leaderboards all carry over. The old server is left stopped; the script prints a rollback command.
+4. Point clients at the new server:
+   - **Real domain:** change its A record to the new IP, set `DOMAIN=` in `.env`, then run `docker compose up -d`. Nothing changes for players.
+   - **sslip.io name:** the URL changes with the IP. Update `SERVER_URL` in your games and in the dashboard login.
+5. Run `sudo sh tune-network.sh`.
+
 ## Latency tuning
 
 ```bash
 sudo sh tune-network.sh      # BBR + fq, low TCP send buffering, no slow-start after idle (persists across reboots)
 ```
 
-The biggest factor is the network path between players and the VPS. Check the **Ping** column in the dashboard. If players are far from the server or their ISP routes badly, put the domain behind **Cloudflare** (proxied DNS record; WebSockets work on the free plan). Cloudflare's backbone often beats ISP routing. Measured from Perth to the Kuala Lumpur VPS: **314 ms direct vs 239 ms through Cloudflare**. Hosting the VPS in the same region as your players matters most of all.
+The biggest factor is the network path between players and the VPS. Check the **Ping / link** column in the dashboard; it also shows which link each player ended up on. If players are far from the server or their ISP routes badly, put the domain behind **Cloudflare** (proxied DNS record; WebSockets work on the free plan). Cloudflare doesn't proxy raw UDP, so set `UDP_HOST` to a DNS-only record (or the IP) when you do this. Cloudflare's backbone often beats ISP routing. Measured from Perth to the Kuala Lumpur VPS: **314 ms direct vs 239 ms through Cloudflare**. Hosting the VPS in the same region as your players matters most of all.
 
 ## Dashboard on GitHub Pages
 
@@ -78,7 +99,7 @@ Push the repo, then go to **Settings → Pages → Deploy from branch → `main`
 
 ```bash
 cd server && npm install && npm start     # http://localhost:8080, admin token printed on first run
-npm test                                  # end-to-end smoke test (26 checks)
+npm test                                  # end-to-end smoke test (56 checks, incl. UDP/WebRTC, 30% packet loss, link failover)
 ```
 
 ## Configuration (`.env`)
@@ -93,6 +114,12 @@ npm test                                  # end-to-end smoke test (26 checks)
 | `RECONNECT_GRACE_MS` | `15000` | How long a dropped player keeps their room slot |
 | `MAX_ROOM_PLAYERS` | `256` | |
 | `MAX_CONNS_PER_IP` | `50` | |
+| `PUBLIC_IP` | – | Public IPv4 advertised in WebRTC candidates. Required in Docker for browsers to reach WebRTC. |
+| `UDP_PORT` | `8081` | Raw UDP transport, `0` = off |
+| `RTC_PORT` | `0` (random ports) | WebRTC on one multiplexed UDP port (compose sets `8082`) |
+| `WEBRTC` | `true` | `false` turns off WebRTC |
+| `UDP_HOST` | host the client connected to | Host clients send raw UDP to |
+| `ICE_SERVERS` | – | Comma-separated STUN/TURN URLs for the server's WebRTC peer |
 
 ## Admin REST API
 

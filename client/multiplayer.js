@@ -51,6 +51,93 @@
     constructor(code, message) { super(message || code); this.code = code; this.name = 'MultiplayerError'; }
   }
 
+  // Node built-ins without an import statement, so this file still loads as a plain browser script.
+  const nodeModule = (name) => {
+    try { return typeof process !== 'undefined' && process.getBuiltinModule ? process.getBuiltinModule(name) : null; } catch (e) { return null; }
+  };
+
+  /**
+   * Session layer, shared with the server. One ordered, reliable message stream that can ride on any
+   * transport (link) and move between them mid-game without losing or reordering anything.
+   *   reliable:   {"q":seq,"a":ack,"m":msg}   resent until acked, delivered in seq order, duplicates dropped
+   *   unreliable: {"a":ack,"m":msg}            delivered on arrival, may be lost (latest-wins data)
+   *   ack only:   {"a":ack}
+   * A link is { kind, reliable, max, send(frame, unreliable), alive() }. `reliable` links (WebSocket, the
+   * WebRTC ordered channel) never need a resend unless they die; UDP frames are resent after an RTO.
+   * Frames bigger than link.max go over `fallback` (the WebSocket); seq numbers keep them in order.
+   */
+  class Session {
+    constructor(fallback, deliver) {
+      this.fallback = this.active = fallback;
+      this.deliver = deliver;      // (msg, link, unreliable) => void
+      this.rtt = 100;              // smoothed RTT of the active link (ms), drives the resend timeout
+      this.out = 0;                // last reliable seq sent
+      this.unacked = [];           // [{ q, s, via, at }] in seq order
+      this.inNext = 1;             // next reliable seq expected
+      this.buf = new Map();        // out-of-order arrivals
+      this.ackOwed = false;
+    }
+    _link(s) { const t = this.active; return t.alive() && s.length <= t.max ? t : this.fallback; }
+    _frame(q, s) {
+      let f = '{';
+      if (q) f += '"q":' + q + ',';
+      if (this.ackOwed) { f += '"a":' + (this.inNext - 1) + ','; this.ackOwed = false; }
+      return f + '"m":' + s + '}';
+    }
+    /** Send a serialized message. Returns the number of unacked reliable messages (for backpressure checks). */
+    send(s, unreliable) {
+      const t = this._link(s);
+      if (unreliable) { t.send(this._frame(0, s), true); return this.unacked.length; }
+      const q = ++this.out;
+      this.unacked.push({ q, s, via: t, at: Date.now() });
+      t.send(this._frame(q, s), false);
+      return this.unacked.length;
+    }
+    recv(f, link) {
+      if (typeof f.a === 'number') while (this.unacked.length && this.unacked[0].q <= f.a) this.unacked.shift();
+      if (f.m === undefined) return;
+      if (typeof f.q !== 'number') return this.deliver(f.m, link, true);
+      this.ackOwed = true;
+      if (f.q < this.inNext) return; // duplicate (resend that crossed our ack)
+      if (f.q > this.inNext) { if (this.buf.size < 4096) this.buf.set(f.q, f.m); return; }
+      this.inNext++;
+      this.deliver(f.m, link, false);
+      while (this.buf.has(this.inNext)) { const m = this.buf.get(this.inNext); this.buf.delete(this.inNext++); this.deliver(m, link, false); }
+    }
+    /** Call every ~25 ms: resends what was lost (or stranded on a dead link) and flushes a pending ack. */
+    tick(now) {
+      const rto = Math.min(1500, Math.max(100, this.rtt * 2 + 80));
+      for (const u of this.unacked) {
+        if (u.via.alive() && (u.via.reliable || now - u.at < rto)) continue;
+        const t = this._link(u.s);
+        u.via = t; u.at = now;
+        t.send(this._frame(u.q, u.s), false);
+      }
+      if (this.ackOwed) { this.ackOwed = false; this._link('').send('{"a":' + (this.inNext - 1) + '}', true); }
+    }
+  }
+
+  const TRANSPORTS = ['webrtc', 'udp', 'websocket'];
+  // How much worse (ms) a link must score before we leave it: avoids flapping between near-equal links.
+  const SWITCH_MARGIN = 2;
+  // Tie-break: given equal numbers, prefer the UDP-based links (no TCP head-of-line blocking on loss).
+  // The WebSocket handicap is bigger than SWITCH_MARGIN so equal links still move off TCP.
+  const BIAS = { webrtc: 0, udp: 1, websocket: 6 };
+  function newLink(kind, o) {
+    return Object.assign({ kind, reliable: false, max: 1150, open: false, failed: false, srtt: 0, jitter: 0, samples: 0,
+      hist: [], pend: new Map(), lastPong: 0, alive() { return this.open; }, close() {} }, o);
+  }
+  function linkStats(l) {
+    const loss = l.hist.length ? l.hist.reduce((a, b) => a + b, 0) / l.hist.length : 0;
+    return { open: l.open, rtt: Math.round(l.srtt * 10) / 10, jitter: Math.round(l.jitter * 10) / 10, loss: Math.round(loss * 100) / 100, samples: l.samples };
+  }
+  function linkScore(l, now) {
+    if (!l.alive() || !l.samples || (l.kind !== 'websocket' && l.samples < 3)) return Infinity;
+    for (const at of l.pend.values()) if (now - at > 2500) return Infinity; // stopped answering
+    const s = linkStats(l);
+    return l.srtt + 2 * l.jitter + 400 * s.loss + BIAS[l.kind];
+  }
+
   class Multiplayer {
     /**
      * @param {object} o
@@ -62,6 +149,11 @@
      * @param {number} [o.timeout=10000] Request timeout ms
      * @param {Function} [o.WebSocket]   Custom WebSocket implementation (e.g. `ws` in older Node)
      * @param {boolean} [o.optimistic=true] Apply your own setState writes locally at once (server order still wins)
+     * @param {string[]} [o.transports=['webrtc','udp','websocket']] Links the SDK may use. It connects over WebSocket,
+     *   measures every allowed link in the background and moves traffic to the fastest. ['websocket'] = WebSocket only.
+     * @param {Function} [o.RTCPeerConnection] WebRTC implementation for Node (e.g. require('node-datachannel/polyfill').RTCPeerConnection)
+     * @param {RTCIceServer[]} [o.iceServers=[]] STUN/TURN servers for the WebRTC link (rarely needed: the server has a public IP)
+     * @param {number} [o.probeInterval=1000] ms between background link measurements once settled
      */
     constructor(o = {}) {
       if (!o.url || !o.key) throw new Error('Multiplayer: { url, key } are required');
@@ -69,7 +161,11 @@
       if (!/\/ws$/.test(url)) url += '/ws';
       this.url = url;
       this.key = o.key;
-      this.opts = Object.assign({ identity: 'tab', autoReconnect: true, timeout: 10000, optimistic: true }, o);
+      this.opts = Object.assign({ identity: 'tab', autoReconnect: true, timeout: 10000, optimistic: true,
+        transports: TRANSPORTS, iceServers: [], probeInterval: 1000 }, o);
+      this.transport = null;     // link in use: 'webrtc' | 'udp' | 'websocket'
+      this._links = new Map();   // kind -> link
+      this._pseq = 0;
       this._optim = []; // my state batches applied locally, awaiting the server echo
       this._WS = o.WebSocket || globalThis.WebSocket;
       this._store = storageFor(this.opts.identity);
@@ -91,6 +187,7 @@
       this.players = new Map(); // id -> { id, name, data, connected, joined, username }
       this.latency = 0;
       this._samples = new Map(); // playerId -> last two data samples (for predict())
+      this._pseen = new Map();   // playerId -> newest fast-lane snapshot seq applied
       this.storage = {
         get: (key, o = {}) => this.request('kv.get', { key, scope: o.scope, player: o.player }),
         set: (key, value, o = {}) => this.request('kv.set', { key, value, scope: o.scope }),
@@ -142,24 +239,27 @@
         try { ws = new this._WS(this.url); } catch (e) { this._connecting = null; return reject(e); }
         this._ws = ws;
         let welcomed = false;
+        // The WebSocket opens first (instant, works everywhere) and stays up as the signalling channel and fallback.
+        const wsLink = newLink('websocket', { reliable: true, max: Infinity, open: true,
+          send: (f) => { if (ws.readyState === 1) ws.send(f); }, alive: () => ws.readyState === 1 });
+        this._links = new Map([['websocket', wsLink]]);
+        this.transport = 'websocket';
+        this._sess = new Session(wsLink, (m) => {
+          if (m.t !== 'welcome') return this._onMessage(m);
+          welcomed = true;
+          this._connecting = null;
+          this._onWelcome(m).then(resolve, reject);
+        });
         ws.onopen = () => {
-          ws.send(JSON.stringify({ t: 'hello', v: 1, key: this.key, token: this._store.getItem(this._tokenKey) || undefined, name: this.name || undefined }));
+          this._tickTimer = setInterval(() => this._sess.tick(Date.now()), 25);
+          this._sess.send(JSON.stringify({ t: 'hello', v: 2, key: this.key, token: this._store.getItem(this._tokenKey) || undefined, name: this.name || undefined }));
           // Pipeline: send the (re)join right behind hello instead of waiting for welcome.
           const j = this.room && this._retry > 0 ? ['join', { room: this.room.id, options: this._lastJoinOpts || {} }] : this._autoJoin;
           this._autoJoin = null;
           this._joinP = j ? this._send(j[0], j[1]) : null;
           if (this._joinP) this._joinP.catch(() => {});
         };
-        ws.onmessage = (ev) => {
-          let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
-          if (m.t === 'welcome') {
-            welcomed = true;
-            this._connecting = null;
-            this._onWelcome(m).then(resolve, reject);
-            return;
-          }
-          this._onMessage(m);
-        };
+        ws.onmessage = (ev) => this._onFrame(wsLink, ev.data);
         ws.onclose = (ev) => {
           const wasConnected = this.connected;
           this.connected = false;
@@ -167,6 +267,7 @@
           for (const p of this._pending.values()) { clearTimeout(p.timer); p.reject(new MultiplayerError('disconnected')); }
           this._pending.clear();
           clearInterval(this._pingTimer);
+          this._closeLinks();
           const fatal = [4001, 4003, 4004, 4005].includes(ev.code);
           if (ev.code === 4005) this._emit('kicked', ev.reason);
           if (!welcomed) reject(new MultiplayerError(ev.reason || 'connect_failed', `Connection closed (${ev.code} ${ev.reason || ''})`));
@@ -192,6 +293,7 @@
       this._retry = 0;
       this._pingTimer = setInterval(() => this.ping().catch(() => {}), 5000);
       this.ping().catch(() => {});
+      this._startLinks(m.transports || {});
       const joinP = this._joinP; this._joinP = null;
       if (reconnecting && this.room) {
         try { this._applySnapshot(await (joinP || this.request('join', { room: this.room.id, options: this._lastJoinOpts || {} }))); }
@@ -216,8 +318,169 @@
       this._closedByUser = true;
       clearTimeout(this._reconnTimer);
       clearInterval(this._pingTimer);
+      this._closeLinks();
       if (this._ws) try { this._ws.close(1000, 'bye'); } catch (e) {}
       this._resetRoom('disconnected');
+    }
+
+    // ---------- transports ----------
+    // After welcome, open every other allowed link next to the WebSocket and probe them all: fast at first
+    // (so the best link is in use within ~0.5 s), then every probeInterval for the rest of the session.
+    // Traffic moves to the link with the best score (RTT + jitter + loss) and back if it degrades or dies.
+    _startLinks(info) {
+      this._linkInfo = info;
+      this._retryAt = {};
+      this._probeN = 0;
+      this._probeSeq = 0;
+      const loop = () => {
+        this._probeTimer = setTimeout(loop, this._probeN < 15 ? 100 : this.opts.probeInterval);
+        this._ensureLinks();
+        this._probe();
+        this._choose();
+      };
+      loop();
+    }
+    _ensureLinks() {
+      const info = this._linkInfo, now = Date.now();
+      for (const kind of ['webrtc', 'udp']) {
+        if (!info[kind] || !this.opts.transports.includes(kind)) continue;
+        const l = this._links.get(kind);
+        if (l && !l.failed) continue;
+        const r = this._retryAt[kind] || (this._retryAt[kind] = { at: 0, wait: 5000 });
+        if (now < r.at) continue;
+        if (l) { r.wait = Math.min(r.wait * 2, 60000); this._emit('transportFailed', kind); }
+        r.at = now + r.wait;
+        try { kind === 'udp' ? this._openUdp(info.udp) : this._openRtc(info.webrtc); } catch (e) { /* unsupported here */ }
+      }
+    }
+    _probe() {
+      const now = Date.now();
+      this._probeN++;
+      for (const l of this._links.values()) {
+        for (const [id, at] of l.pend) if (now - at > 1000) { l.pend.delete(id); l.hist.push(1); if (l.hist.length > 20) l.hist.shift(); }
+        if (!l.alive()) continue;
+        const id = ++this._probeSeq;
+        l.pend.set(id, now);
+        l.send('{"pi":' + id + '}', true);
+      }
+    }
+    _pong(l, id) {
+      const at = l.pend.get(id);
+      if (at == null) return;
+      l.pend.delete(id);
+      const r = Date.now() - at;
+      l.jitter = l.samples ? l.jitter * 0.8 + Math.abs(r - l.srtt) * 0.2 : 0;
+      l.srtt = l.samples ? l.srtt * 0.8 + r * 0.2 : r;
+      l.samples++; l.lastPong = Date.now();
+      l.hist.push(0); if (l.hist.length > 20) l.hist.shift();
+    }
+    _choose() {
+      const now = Date.now(), cur = this._links.get(this.transport);
+      let best = null, bestScore = Infinity;
+      for (const l of this._links.values()) { const s = linkScore(l, now); if (s < bestScore) { best = l; bestScore = s; } }
+      const curScore = cur ? linkScore(cur, now) : Infinity;
+      if (!best) best = this._links.get('websocket');
+      if (best !== cur && (curScore === Infinity || bestScore < curScore - Math.max(SWITCH_MARGIN, curScore * 0.1))) {
+        if (curScore !== Infinity && ++this._better < 2) return; // must win twice in a row unless the current link is dead
+        this._use(best);
+      }
+      this._better = 0;
+      if (cur === best && this._probeN % 5 === 0) this._ctl({ use: best.kind, rtt: Math.round(best.srtt) }); // keep the server's resend timer tuned
+    }
+    _use(l) {
+      const prev = this.transport;
+      this.transport = l.kind;
+      this._sess.active = l;
+      this._sess.rtt = l.srtt || this._sess.rtt;
+      this._ctl({ use: l.kind, rtt: Math.round(l.srtt) });
+      this._emit('transport', l.kind, prev, this.transportStats);
+    }
+    /** Live measurements of every link: { webrtc: { open, rtt, jitter, loss, samples }, udp: {...}, websocket: {...} } */
+    get transportStats() {
+      const out = {};
+      for (const [k, l] of this._links) out[k] = linkStats(l);
+      return out;
+    }
+    _ctl(obj) { if (this._ws && this._ws.readyState === 1) this._ws.send(JSON.stringify(obj)); }
+    _onFrame(l, data) {
+      if (typeof data !== 'string') return;
+      let f; try { f = JSON.parse(data); } catch (e) { return; }
+      if (!isObj(f)) return;
+      if (f.po != null) return this._pong(l, f.po);
+      if (f.sig) return this._onSignal(f.sig);
+      if (f.hk) { l.open = true; return; }
+      if (this._sess) this._sess.recv(f, l);
+    }
+    _closeLinks() {
+      clearTimeout(this._probeTimer);
+      clearInterval(this._tickTimer);
+      for (const l of this._links.values()) if (l.kind !== 'websocket') { l.open = false; l.failed = true; try { l.close(); } catch (e) {} }
+    }
+
+    // Raw UDP: Node (and other native runtimes) only, browsers can't open UDP sockets. Every datagram to the
+    // server is prefixed with the session id from welcome; the server only answers the address that proved it.
+    _openUdp(u) {
+      const dgram = nodeModule('node:dgram'), dns = nodeModule('node:dns');
+      if (!dgram || !dns || !u.sid) return;
+      const old = this._links.get('udp'); if (old) old.close();
+      const host = (u.host || new URL(this.url.replace(/^ws/, 'http')).hostname).replace(/^\[|\]$/g, '');
+      const sess = this._sess;
+      const l = newLink('udp', { reliable: false, max: 1150 });
+      this._links.set('udp', l);
+      dns.lookup(host, (err, addr, family) => {
+        if (err || sess !== this._sess || l.failed) { l.failed = true; return; }
+        const sock = dgram.createSocket(family === 6 ? 'udp6' : 'udp4');
+        const prefix = u.sid + '|';
+        sock.on('error', () => { l.open = false; l.failed = true; });
+        sock.on('message', (buf, ri) => { if (ri.port === u.port) this._onFrame(l, buf.toString()); });
+        l.send = (f) => { try { sock.send(prefix + f, u.port, addr); } catch (e) {} };
+        l.close = () => { clearInterval(hs); try { sock.close(); } catch (e) {} };
+        sock.unref();
+        let tries = 0;
+        const hs = setInterval(() => {
+          if (l.open) return clearInterval(hs);
+          if (++tries > 15) { clearInterval(hs); l.failed = true; return l.close(); }
+          sock.send(prefix + '{"h":1}', u.port, addr);
+        }, 200);
+        if (hs.unref) hs.unref();
+        sock.send(prefix + '{"h":1}', u.port, addr);
+      });
+    }
+
+    // WebRTC data channels to the server: 'r' ordered+reliable, 'u' unordered with no retransmits (UDP-like).
+    // Signalling (offer / answer / ICE candidates) goes over the WebSocket.
+    async _openRtc() {
+      const PC = this.opts.RTCPeerConnection || globalThis.RTCPeerConnection;
+      if (!PC) return;
+      const old = this._links.get('webrtc'); if (old) old.close();
+      const sess = this._sess;
+      const pc = new PC({ iceServers: this.opts.iceServers });
+      const r = pc.createDataChannel('r', { ordered: true });
+      const u = pc.createDataChannel('u', { ordered: false, maxRetransmits: 0 });
+      const l = newLink('webrtc', { reliable: true, max: 60000, pc,
+        send: (f, unrel) => { const ch = unrel && u.readyState === 'open' ? u : r; if (ch.readyState === 'open') try { ch.send(f); } catch (e) {} },
+        alive: () => l.open && r.readyState === 'open',
+        close: () => { clearTimeout(giveUp); try { pc.close(); } catch (e) {} } });
+      this._links.set('webrtc', l);
+      const onOpen = () => { if (r.readyState === 'open' && u.readyState === 'open') { l.open = true; clearTimeout(giveUp); } };
+      const onDown = () => { l.open = false; l.failed = true; };
+      r.onopen = u.onopen = onOpen;
+      r.onclose = onDown;
+      r.onmessage = u.onmessage = (ev) => this._onFrame(l, ev.data);
+      pc.onicecandidate = (ev) => { if (ev.candidate && ev.candidate.candidate) this._ctl({ sig: { cand: ev.candidate.candidate, mid: ev.candidate.sdpMid } }); };
+      pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed' || pc.connectionState === 'closed') onDown(); };
+      const giveUp = setTimeout(() => { if (!l.open) { onDown(); l.close(); } }, 8000);
+      if (giveUp.unref) giveUp.unref();
+      try {
+        await pc.setLocalDescription(await pc.createOffer());
+        if (sess !== this._sess) return l.close();
+        this._ctl({ sig: { type: 'offer', sdp: pc.localDescription.sdp } });
+      } catch (e) { onDown(); l.close(); }
+    }
+    _onSignal(sig) {
+      const l = this._links.get('webrtc');
+      if (!l || !l.pc || sig.type !== 'answer') return;
+      l.pc.setRemoteDescription({ type: 'answer', sdp: sig.sdp }).catch(() => { l.failed = true; });
     }
 
     _setIdentity(r) {
@@ -239,13 +502,13 @@
         const rid = ++this._rid;
         const timer = setTimeout(() => { this._pending.delete(rid); reject(new MultiplayerError('timeout')); }, this.opts.timeout);
         this._pending.set(rid, { resolve, reject, timer });
-        this._ws.send(JSON.stringify(Object.assign({}, payload, { t, rid })));
+        this._sess.send(JSON.stringify(Object.assign({}, payload, { t, rid })));
       });
     }
-    /** Fire-and-forget (no ack). Returns false if not connected. */
-    _fire(t, payload) {
+    /** Fire-and-forget (no reply). unreliable = may be dropped, never resent (fast lane). Returns false if not connected. */
+    _fire(t, payload, unreliable) {
       if (!this._ws || this._ws.readyState !== 1 || !this.connected) return false;
-      this._ws.send(JSON.stringify(Object.assign({}, payload, { t })));
+      this._sess.send(JSON.stringify(Object.assign({}, payload, { t })), unreliable);
       return true;
     }
 
@@ -271,6 +534,10 @@
         case 'player': {
           const pl = this.players.get(m.id);
           if (!pl) return;
+          if (m.s != null) { // fast-lane snapshot: drop anything older than what we already have
+            if (m.s <= (this._pseen.get(m.id) || 0)) return;
+            this._pseen.set(m.id, m.s);
+          }
           if (m.name) pl.name = m.name;
           if (m.data) {
             const now = Date.now(), prev = this._samples.get(m.id);
@@ -289,6 +556,7 @@
           const pl = this.players.get(m.id);
           this.players.delete(m.id);
           this._samples.delete(m.id);
+          this._pseen.delete(m.id);
           return this._emit('playerLeft', pl || { id: m.id }, m.reason);
         }
         case 'player.connection': {
@@ -379,11 +647,20 @@
     getState(path) { return getPath(this.state, path); }
 
     // ---------- per-player data ----------
-    /** Merge into your own player data (positions, ready flags...). Applied locally immediately, broadcast to others. Fire-and-forget; null deletes a key. */
-    setPlayer(data, { replace = false } = {}) {
+    /**
+     * Merge into your own player data (positions, ready flags...). Applied locally immediately, broadcast to others. Fire-and-forget; null deletes a key.
+     * { unreliable: true } = fast lane for high-rate data like movement: each update carries your whole player data
+     * and a sequence number over the unreliable channel, so a lost or late packet is simply superseded by the next.
+     * A reliable copy follows ~150 ms after the last update, so the final value always arrives.
+     */
+    setPlayer(data, { replace = false, unreliable = false } = {}) {
       const me = this.me;
       if (me) { if (replace) me.data = {}; merge(me.data, data); this._emit('playerUpdated', me, data); }
-      return this._fire('player.set', { data, replace });
+      if (!unreliable || !me) return this._fire('player.set', { data, replace });
+      const snap = () => ({ data: me.data, replace: true, s: (this._pseq = Math.max(this._pseq + 1, Date.now())) });
+      clearTimeout(this._settle);
+      this._settle = setTimeout(() => this.me === me && this._fire('player.set', snap()), 150);
+      return this._fire('player.set', snap(), true);
     }
 
     /**
@@ -409,8 +686,11 @@
     }
 
     // ---------- messaging ----------
-    /** Send a message. to: undefined (everyone else) | 'all' | 'host' | 'server' (game's server script) | playerId | [ids]. Outside a room, `to` must be a playerId (direct message). */
-    send(type, data, to, { self = false } = {}) { return this._fire('send', { type, data, to, self }); }
+    /**
+     * Send a message. to: undefined (everyone else) | 'all' | 'host' | 'server' (game's server script) | playerId | [ids]. Outside a room, `to` must be a playerId (direct message).
+     * { unreliable: true } = fast lane: may be dropped or arrive out of order, never resent (inputs you send every frame anyway).
+     */
+    send(type, data, to, { self = false, unreliable = false } = {}) { return this._fire('send', { type, data, to, self }, unreliable); }
     /** Same as send but resolves when the server accepted it (rejects on error). */
     sendReliable(type, data, to, { self = false } = {}) { return this.request('send', { type, data, to, self }); }
 
@@ -430,6 +710,7 @@
   }
 
   Multiplayer.MultiplayerError = MultiplayerError;
+  Multiplayer.Session = Session; // the server uses the same session layer
   Multiplayer.default = Multiplayer;
   return Multiplayer;
 });

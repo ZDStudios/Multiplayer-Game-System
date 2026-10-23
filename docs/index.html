@@ -103,7 +103,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
     </div>
     <div class="panel" id="playersPanel" style="margin-top:12px">
       <h2>Players online <span class="tag acc" id="pCount">0</span><span class="sp"></span><input id="pSearch" placeholder="filter name / id / game / room" style="width:240px;text-transform:none;letter-spacing:0"></h2>
-      <div class="tablewrap" style="max-height:420px;overflow:auto"><table><thead><tr><th>Player</th><th>Game</th><th>Room</th><th>Ping</th><th>Connected</th><th></th></tr></thead><tbody id="players"></tbody></table></div>
+      <div class="tablewrap" style="max-height:420px;overflow:auto"><table><thead><tr><th>Player</th><th>Game</th><th>Room</th><th>Ping / link</th><th>Connected</th><th></th></tr></thead><tbody id="players"></tbody></table></div>
     </div>
     <div id="detail" class="hidden"></div>
   </div>
@@ -204,7 +204,7 @@ function renderPlayers() {
   const list = all.filter((p) => !q || [p.name, p.id, p.gameName, p.room, p.username].some((v) => String(v || '').toLowerCase().includes(q)));
   $('#pCount').textContent = all.length;
   $('#players').innerHTML = list.map((p, i) => `<tr><td><b>${esc(p.name)}</b> <span class="mute mono">${esc(p.id)}</span>${p.username ? ` <span class="tag">@${esc(p.username)}</span>` : ''}</td>
-    <td>${esc(p.gameName)}</td><td class="mono">${p.room ? esc(p.room) : '<span class="mute">lobby</span>'}</td><td class="mono">${ping(p.rtt)}</td><td class="mute">${ago(p.since).replace(' ago', '')}</td>
+    <td>${esc(p.gameName)}</td><td class="mono">${p.room ? esc(p.room) : '<span class="mute">lobby</span>'}</td><td class="mono">${ping(p.rtt)}${p.transport ? ` <span class="tag">${esc(p.transport)}</span>` : ''}</td><td class="mute">${ago(p.since).replace(' ago', '')}</td>
     <td><button class="sm danger" data-pk="${i}">Kick</button> <button class="sm danger" data-pb="${i}">Ban</button></td></tr>`).join('')
     || `<tr><td colspan="6" class="empty">${all.length ? 'No matches' : 'Nobody online'}</td></tr>`;
   const act = (p, ban) => async () => {
@@ -290,9 +290,9 @@ async function renderDetail() {
         <span class="sp"></span><span class="mute">${ago(r.created).replace(' ago', '')} old</span>
         <button class="sm danger" data-close="${esc(r.id)}">Close</button></summary>
       <div class="inner">
-        <table><thead><tr><th>Player</th><th>Status</th><th>Ping</th><th>Data</th><th></th></tr></thead><tbody>
+        <table><thead><tr><th>Player</th><th>Status</th><th>Ping / link</th><th>Data</th><th></th></tr></thead><tbody>
         ${r.players.map((p) => `<tr><td>${p.id === r.host ? '👑 ' : ''}<b>${esc(p.name)}</b> <span class="mute mono">${esc(p.id)}</span>${p.username ? ` <span class="tag">@${esc(p.username)}</span>` : ''}</td>
-          <td>${p.connected ? '<span class="tag ok">online</span>' : '<span class="tag bad">reconnecting</span>'}</td><td class="mono">${ping(p.rtt)}</td>
+          <td>${p.connected ? '<span class="tag ok">online</span>' : '<span class="tag bad">reconnecting</span>'}</td><td class="mono">${ping(p.rtt)}${p.transport ? ` <span class="tag">${esc(p.transport)}</span>` : ''}</td>
           <td class="mono mute" style="max-width:380px;overflow:hidden;text-overflow:ellipsis">${esc(p.data)}</td>
           <td><button class="sm danger" data-kick="${esc(r.id)}|${esc(p.id)}">Kick</button></td></tr>`).join('')}
         </tbody></table>

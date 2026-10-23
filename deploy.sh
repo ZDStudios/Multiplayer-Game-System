@@ -6,10 +6,15 @@ if [ ! -f .env ]; then
   cp .env.example .env
   TOKEN=$(openssl rand -hex 32)
   IP=$(curl -fsS https://api.ipify.org || hostname -I | awk '{print $1}')
-  sed -i "s/^ADMIN_TOKEN=.*/ADMIN_TOKEN=$TOKEN/; s/^DOMAIN=.*/DOMAIN=$(echo "$IP" | tr . -).sslip.io/" .env
+  sed -i "s/^ADMIN_TOKEN=.*/ADMIN_TOKEN=$TOKEN/; s/^DOMAIN=.*/DOMAIN=$(echo "$IP" | tr . -).sslip.io/; s/^PUBLIC_IP=.*/PUBLIC_IP=$IP/" .env
   echo "Created .env (edit DOMAIN if you have a real domain)."
 fi
-command -v ufw >/dev/null 2>&1 && ufw status | grep -q active && { ufw allow 80/tcp; ufw allow 443/tcp; ufw allow 443/udp; } || true
+# Older installs: add the public IP that WebRTC advertises to browsers.
+if ! grep -q '^PUBLIC_IP=.' .env; then
+  IP=$(curl -fsS https://api.ipify.org || hostname -I | awk '{print $1}')
+  sed -i '/^PUBLIC_IP=/d' .env; echo "PUBLIC_IP=$IP" >> .env
+fi
+command -v ufw >/dev/null 2>&1 && ufw status | grep -q active && { ufw allow 80/tcp; ufw allow 443/tcp; ufw allow 443/udp; ufw allow 8081/udp; ufw allow 8082/udp; } || true
 docker compose up -d --build
 . ./.env
 echo ""
