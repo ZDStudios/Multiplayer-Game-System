@@ -10,6 +10,7 @@
 //     onMessage(room, player, type, data) {},   // client: mp.send(type, data, 'server')
 //     onTick(room, dtSeconds) {},
 //   };
+// `room` also has storage / leaderboard / inbox (see api() below) for persistent, server-written data.
 import vm from 'node:vm';
 
 const HOOK_TIMEOUT_MS = 50;   // a single hook call may not block the event loop longer than this
@@ -80,6 +81,15 @@ export function createScripting(h) {
     if (room.api) return room.api;
     const op = (p, v, del) => { setPath(room.state, p, v, del); (room.pendingOps ||= []).push(del ? [p, null, 1] : [p, v]); };
     const toIds = (to) => (to == null || to === 'all' ? null : Array.isArray(to) ? to : [to]);
+    const svc = h.services, gid = room.game.id;
+    // { player: id } -> that player's public data, { player, scope: 'private' } -> their private data, else game data.
+    const owner = (o) => {
+      const scope = o.scope || (o.player != null ? 'player' : 'game');
+      if (scope === 'game') return ['game', ''];
+      if (scope !== 'player' && scope !== 'private') throw new E('bad_scope');
+      if (o.player == null) throw new E('bad_player', 'storage: pass { player: id } for player / private data');
+      return [scope, String(o.player)];
+    };
     room.api = {
       get id() { return room.id; },
       get state() { return room.state; },          // read freely; WRITE via setState/batchState so clients get it
@@ -109,6 +119,26 @@ export function createScripting(h) {
       },
       lock: (locked = true) => { room.locked = !!locked; },
       now: () => Date.now(),
+      // Persistent services, without the client-side write locks (gameDataWrite / playerDataWrite /
+      // clientWrite:false boards): the server script is the trusted writer for authoritative games.
+      storage: {
+        get: (key, o = {}) => { const r = svc.storage.get(gid, ...owner(o), key); return o.meta ? r : r ? r.value : null; },
+        set: (key, value, o = {}) => svc.storage.put(gid, ...owner(o), key, value, o),
+        update: (key, ops, o = {}) => svc.storage.update(gid, ...owner(o), key, ops, o),
+        incr: (key, by = 1, o = {}) => svc.storage.incr(gid, ...owner(o), key, by, o.path),
+        delete: (key, o = {}) => svc.storage.del(gid, ...owner(o), key, o),
+        list: (o = {}) => svc.storage.list(gid, ...owner(o), o),
+        query: (o = {}) => svc.storage.query(gid, o),
+      },
+      leaderboard: {
+        submit: (playerId, board, score, meta) => {
+          const m = room.players.get(String(playerId));
+          return svc.leaderboard.submit(gid, board, String(playerId), m ? m.name : null, score, meta);
+        },
+        top: (board, o) => svc.leaderboard.top(gid, board, o),
+        around: (board, playerId, o) => svc.leaderboard.around(gid, board, String(playerId), o),
+      },
+      inbox: { send: (playerId, type, data) => svc.inbox.send(gid, playerId, 'server', 'server', type, data) },
     };
     return room.api;
   }

@@ -154,27 +154,117 @@ For movement, use `mp.setPlayer({ x, y }, { unreliable: true })`. Each update th
 | `mp.onMessage(type, (data, fromId, raw) => {})` | `fromId === 'server'` for admin broadcasts (type `announcement` by default). |
 | Outside a room | `mp.send('invite', {room: 'ABC123'}, playerId)` sends a direct message to any online player of the game. |
 
-### Persistent storage (key/value, JSON values ≤ 64 KB)
+### Persistent storage (JSON key/value, values ≤ 64 KB)
+Three scopes: `'player'` (default; you write, anyone can read), `'private'` (only you) and `'game'` (shared by everyone; the dashboard can make it read-only). Keys are any string up to 128 chars, values any JSON.
 ```js
-await mp.storage.set('save', {level: 3, coins: 120});            // scope 'player' (default): I write, anyone can read
-await mp.storage.get('save');                                    // mine
-await mp.storage.get('save', {player: otherId});                 // someone else's public player data
-await mp.storage.set('inventory', [...], {scope: 'private'});    // only I can read/write
-await mp.storage.get('config', {scope: 'game'});                 // game-wide (admin can make it read-only in dashboard)
-await mp.storage.incr('totalMatches', 1, {scope: 'game'});       // atomic counter → new value
-await mp.storage.list({scope: 'player', prefix: 'slot_'});       // [{key, value, updated}]
+await mp.storage.set('save', {level: 3, coins: 120});            // → {version}
+await mp.storage.get('save');                                    // value, or null if missing
+await mp.storage.get('save', {player: otherId});                 // another player's public data
+await mp.storage.get('save', {meta: true});                      // {value, version, updated, expires}
+await mp.storage.set('inventory', [...], {scope: 'private'});
+await mp.storage.getMany(['a', 'b'], {scope: 'private'});        // {a: ..., b: ...}
+await mp.storage.setMany({a: 1, b: 2});                          // atomic: all or nothing
 await mp.storage.delete('save');
+await mp.storage.list({prefix: 'slot_', after: 'slot_3', limit: 50});  // [{key, value, version, updated, expires}], key order
+
+// Atomic edits on the server: no read-modify-write race between devices or players
+await mp.storage.incr('wins');                                   // → new number
+await mp.storage.incr('stats', 5, {path: 'xp'});                 // number inside an object
+await mp.storage.update('profile', [                             // → {value, version}
+  ['incr', 'coins', 50], ['max', 'bestLap', 91.2], ['min', 'fastest', 41.0],
+  ['push', 'history', {won: true}, 20],      // append; 4th arg caps the list (keeps the newest 20)
+  ['addToSet', 'badges', 'first_win'], ['pull', 'badges', 'rookie'],
+  ['merge', 'settings', {music: false}],     // null values delete keys
+  ['set', 'title', 'Champion'], ['unset', 'oldField'],
+]);                                          // path '' = the whole value
+
+// Optimistic concurrency: write only if nobody changed it since you read it
+const {value, version} = await mp.storage.get('guild:42', {scope: 'game', meta: true});
+await mp.storage.set('guild:42', {...value, members: [...]}, {scope: 'game', ifVersion: version}); // rejects 'version_conflict'
+await mp.storage.set('lock:boss', mp.playerId, {scope: 'game', ifVersion: 0});                   // 0 = only if it doesn't exist
+
+// Expiry
+await mp.storage.set('dailyChest', {opened: true}, {ttl: 86400});  // seconds; then it reads as missing
+
+// Query every player's public data (or game data). Paths are dot paths into the JSON value.
+await mp.storage.query({ key: 'profile', where: [['level', '>=', 10], ['region', '=', 'au']], orderBy: 'level', desc: true, limit: 20 });
+// → [{player, name, key, value, version, updated}]. ops: = != > >= < <= in exists. scope: 'player' (default) | 'game'.
+// Private data is never queryable. With scope 'game', filter by key prefix: {scope: 'game', prefix: 'guild:'}.
 ```
-`get` returns `null` when a key is missing. Player storage is tied to the player identity, so use `identity: 'device'` or accounts if saves must survive a closed tab.
+Player storage is tied to the player identity, so use `identity: 'device'` or accounts if saves must survive a closed tab. Each player can hold 1000 keys per scope (the game scope holds 10,000). Anti-cheat: set **Player data writes → Server script only** in the dashboard. Clients can then still read, but only your server script can change player data (currency, XP, unlocks).
 
 ### Leaderboards
+Each board has a config. It's set by the first submit (`config`) or by the admin API, and can't be changed by clients afterwards:
+
+| Config | Values | |
+|---|---|---|
+| `mode` | `'max'` (default), `'min'`, `'sum'`, `'last'` | How a new score combines with the player's stored one. |
+| `sort` | `'desc'` / `'asc'` | Defaults to `'asc'` for `min`, `'desc'` otherwise. |
+| `periods` | any of `'day'`, `'week'`, `'month'` | Extra boards that reset automatically (UTC; weeks start Monday). `'all'` is always kept. |
+| `clientWrite` | `true` / `false` | `false` = only the server script / admin can submit (cheat-proof boards). |
+| `min` / `max` | numbers | Scores outside the range are rejected. |
 ```js
-await mp.leaderboard.submit('highscore', 1234);                  // mode 'max' (default) keeps the best
-await mp.leaderboard.submit('fastest', 41.2, {mode: 'min'});     // 'min' | 'max' | 'sum' | 'set'
-const {entries, me} = await mp.leaderboard.top('highscore', {limit: 10});  // order: 'desc' (default) | 'asc'
-// entries: [{rank, id, name, score}], me: {rank, score} | null
+await mp.leaderboard.submit('highscore', 1234);
+await mp.leaderboard.submit('fastest_lap', 41.2, { config: { mode: 'min', periods: ['day', 'week'] }, meta: { car: 'red', replay: 'r_81' } });
+// → {board, score, rank, improved, periods: {all: {score, rank, improved}, day: {...}, week: {...}}}
+const top = await mp.leaderboard.top('fastest_lap', { period: 'week', limit: 10, offset: 0 });
+// → {entries: [{rank, id, name, score, meta, updated}], total, me, resetsAt, period}
+await mp.leaderboard.top('fastest_lap', { period: 'week', previous: true }); // last week's final standings
+await mp.leaderboard.around('highscore', { range: 5 });          // you ±5 places: {entries, me}
+await mp.leaderboard.friends('highscore');                       // you + your friends, ranked globally
+await mp.leaderboard.players('highscore', [id1, id2]);           // specific players
+await mp.leaderboard.boards();                                   // [{id, mode, sort, periods, clientWrite, min, max, resetsAt}]
 ```
-Use `{order: 'asc'}` with `top()` for boards submitted with `mode: 'min'`.
+Ties rank whoever got the score first higher. With **Leaderboards → Only boards created via the admin API** set in the dashboard, clients can't create new boards.
+
+### Friends, presence and profiles
+```js
+await mp.friends.request(playerId);           // or {username: 'alice_1'} → {state: 'outgoing'} ('friend' if they'd asked you)
+await mp.friends.accept(playerId);            // → {state: 'friend', online, status, data}
+await mp.friends.remove(playerId);            // unfriend / decline / cancel / unblock
+await mp.friends.block(playerId);             // they can't DM you, friend you, mail you or be seen in your chat
+await mp.friends.list();                      // [{id, name, username, state: 'friend'|'incoming'|'outgoing'|'blocked', lastSeen, online?, status?, data?}]
+mp.on('friend', (e) => {});                   // {id, name, state: 'incoming'|'friend'|null}: requests and changes
+await mp.setPresence('in ranked', {map: 'dust'});  // what your friends see (status ≤ 64 chars, data ≤ 512 B)
+mp.on('presence', (p) => {});                 // {id, online, status, data}: a friend came online, went offline or changed status
+await mp.profiles.get([id1, id2]);            // [{id, name, username, online, lastSeen, friend, status?, data?}]: status only for friends
+await mp.profiles.find('alice_1');            // by account username → [profile]
+await mp.profiles.find({name: 'Ali'});        // display-name prefix search, most recently seen first
+```
+
+### Inbox (messages that wait for offline players)
+Gifts, invites, rewards and notifications. They're stored on the server and delivered live if the player is online. Each player keeps their newest 200.
+```js
+await mp.inbox.send(playerId, 'gift', {gold: 50});   // → {id}. data ≤ 8 KB. At most 30 per minute per player.
+mp.on('inbox', (item) => {});                        // {id, from, fromName, type, data, created, read}; mp.inboxUnread counts
+await mp.inbox.list({unread: true, limit: 50, before: lastId});  // {items, total, unread}, newest first
+await mp.inbox.markRead([id]);                       // or markRead() for all
+await mp.inbox.delete([id]);                         // or delete('all')
+```
+`mp.inboxUnread` is filled in on connect, so you can show a badge right away. Server scripts and the admin API send with `from: 'server'`. Set `inboxClientSend: false` in the game settings to allow only those.
+
+### Matchmaking
+```js
+const room = await mp.matchmake('ranked_1v1', { size: 2, rating: myElo });  // resolves when matched, already joined
+await mp.matchmake('squads', { size: 4, minSize: 2, maxWaitMs: 20000, rating: 1200, options: { maxPlayers: 4, meta: { mode: 'squads' } } });
+await mp.cancelMatchmaking();                // the pending matchmake() rejects with 'cancelled'
+await mp.matchmakingStatus();                // {queue, size, waitedMs, waiting} | null
+mp.on('matched', (room, queue) => {});
+```
+Players in the same queue and `size` match when their ratings are within `spread` (default 100). The spread widens by `widen` (default 25) per second of waiting. After `maxWaitMs`, a match can start with `minSize` players. Matched rooms are private, `room.meta.match = {queue, players}`, and the usual `joined` / `playerJoined` events fire. Store ratings in storage or on a leaderboard. Ideally the server script updates them after each match (Elo: `newA = a + 32 * (result - 1 / (1 + 10 ** ((b - a) / 400)))`).
+
+### Chat channels
+Game-wide channels outside rooms (global, trade, a guild id...). The server keeps the last 50 messages of each, and a player can be in 10 channels at once. Channels are open to anyone who knows the name, so use hard-to-guess names for private groups. Inside a room, use `send` instead.
+```js
+const {history, members} = await mp.chat.join('global');
+await mp.chat.send('global', 'gg everyone', {emote: 'wave'});   // text ≤ 500 chars, optional data ≤ 1 KB
+mp.on('chat:global', (m) => {});             // {channel, from, name, text, data, ts}; or mp.on('chat', ...) for all channels
+await mp.chat.leave('global');
+```
+Messages from players you've blocked are never delivered to you.
+
+### Remote config
+`mp.config` is a JSON object the admin edits in the dashboard (**Settings → Remote config**). It's sent on connect and pushed live on every save (`mp.on('config', cfg => ...)`). Use it for tuning values, a message of the day, event toggles or a minimum client version. Clients can't write it.
 
 ### Accounts (optional)
 ```js
@@ -209,10 +299,15 @@ Logging in leaves the current room. Rejoin afterwards. A login kicks any other a
 | `msg:<type>` | Same as `onMessage(type, ...)`. |
 | `error` | `MultiplayerError {code, message}`. Async errors such as `rate_limited` or `replaced`. |
 | `ping` | `latency` |
+| `friend` / `presence` | Friend request or change / a friend's status (see Friends) |
+| `inbox` | `item`: new inbox message |
+| `chat` / `chat:<channel>` | `{channel, from, name, text, data, ts}` |
+| `matched` / `matchmakingCancelled` | `(room, queue)` / `(queue, reason)` |
+| `config` | `config`: remote config changed |
 | `transport` | `(now, previous, stats)`. Traffic moved to another link. |
 | `transportFailed` | `(kind)`. A link couldn't be opened (retried with backoff). |
 
-Request errors reject with `MultiplayerError` (`err.code`): `not_connected`, `timeout`, `not_in_room`, `not_host`, `room_full`, `room_locked`, `room_not_found`, `bad_password`, `banned`, `bad_path`, `bad_key`, `bad_scope`, `forbidden`, `too_large`, `username_taken`, `bad_credentials`, `already_registered`, `player_offline`, `no_server_script`.
+Request errors reject with `MultiplayerError` (`err.code`): `not_connected`, `timeout`, `not_in_room`, `not_host`, `room_full`, `room_locked`, `room_not_found`, `bad_password`, `banned`, `bad_path`, `bad_key`, `bad_scope`, `forbidden`, `too_large`, `username_taken`, `bad_credentials`, `already_registered`, `player_offline`, `no_server_script`, `version_conflict`, `quota_exceeded`, `bad_query`, `board_not_found`, `bad_period`, `bad_score`, `blocked`, `player_not_found`, `no_request`, `not_in_channel`, `cancelled`.
 
 ## 5b. Server scripts (authoritative logic on the server)
 
@@ -238,6 +333,9 @@ module.exports = {
 | `room.setState(path, value)`, `room.deleteState(path)`, `room.batchState([[path, value], [path, null, 1]])` | All writes in one hook call are sent to clients as **one** batched update. |
 | `room.send(type, data, to?)` | `to`: omitted for everyone, a playerId, or an array. Clients receive it with `from === 'server'`. |
 | `room.kick(id, reason?)`, `room.lock(true/false)`, `room.now()` | |
+| `room.storage.get / set / update / incr / delete / list(key, ..., {player?, scope?})` | Persistent storage with the same ops as the client. `{player: id}` = that player's public data; add `scope: 'private'` for theirs; neither = game data. **Not** limited by the dashboard's client write locks, so authoritative games use this for currency, XP and ratings. `room.storage.query(o)` too. |
+| `room.leaderboard.submit(playerId, board, score, meta?)`, `.top(board, o)`, `.around(board, playerId, o)` | Works on `clientWrite: false` boards. |
+| `room.inbox.send(playerId, type, data)` | Rewards and notifications, `from: 'server'`. |
 | `room.data` | Server-only scratch object, never sent to clients. Use it for secrets, RNG seeds and AI state. |
 | `console.log(...)` | Shown in the dashboard activity feed. |
 
@@ -366,9 +464,18 @@ WebSocket `wss://HOST/ws`. Messages are text frames of JSON objects with a type 
 | `state.set` | `ops: [[path, value], [path, null, 1]]` | `true` |
 | `player.set` | `data, replace?` | `true` |
 | `send` | `type, data, to?, self?` (`to: "server"` delivers to the game's server script) | `true` |
-| `kv.get` / `kv.set` / `kv.del` / `kv.incr` / `kv.list` | `key, value?, by?, scope?, player?, prefix?, limit?` | value / `true` / number / list |
-| `lb.submit` | `board, score, mode?` | `{score, rank, improved}` |
-| `lb.top` | `board, limit?, order?` | `{board, entries, me}` |
+| `kv.get` / `kv.getMany` | `key` / `keys, scope?, player?, meta?` | value / `{key: value}` |
+| `kv.set` / `kv.setMany` | `key, value` / `entries, scope?, ifVersion?, ttl?` | `{version}` / `{key: version}` |
+| `kv.del` / `kv.incr` / `kv.update` | `key, scope?, ifVersion?` / `key, by?, path?` / `key, ops, ifVersion?, ttl?` | `true` / number / `{value, version}` |
+| `kv.list` / `kv.query` | `scope?, player?, prefix?, after?, limit?` / `scope?, key?, prefix?, where?, orderBy?, desc?, limit?, offset?` | list |
+| `lb.submit` | `board, score, meta?, config?` | `{board, score, rank, improved, periods}` |
+| `lb.top` / `lb.around` / `lb.players` / `lb.boards` | `board, period?, previous?, limit?, offset?` / `board, player?, range?` / `board, players? \| friends: true` / – | `{entries, me?, total?, resetsAt?}` / configs |
+| `friends.list` / `friends.request` / `friends.accept` / `friends.remove` / `friends.block` | `player` or `username` | list / `{state}` |
+| `presence.set` / `players.get` / `players.find` | `status, data` / `players` / `username` or `name` | `true` / profiles |
+| `inbox.send` / `inbox.list` / `inbox.read` / `inbox.delete` | `to, type, data` / `unread?, before?, limit?` / `ids` (array or `"all"`) | `{id}` / `{items, total, unread}` / counts |
+| `mm.join` / `mm.leave` / `mm.status` | `queue, size?, rating?, minSize?, maxWaitMs?, spread?, widen?, options?` | ticket / `true` / status |
+| `chat.join` / `chat.leave` / `chat.send` | `channel` / `channel` / `channel, text, data?` | `{history, members}` / `true` / `true` |
+| `config.get` | – | config |
 | `auth.register` / `auth.login` | `username, password` | `{playerId, token, username, name}` |
 
 Server pushes:
@@ -378,6 +485,11 @@ Server pushes:
 - `{t:"host", id}`, `{t:"room", room}`, `{t:"left", room, reason}`
 - `{t:"msg", type, data, from, direct?}`
 - `{t:"error", code, message}`
+- `{t:"friend", id, name, state, online?, status?, data?}`, `{t:"presence", id, online, status, data}`
+- `{t:"inbox", item}`, `{t:"chat", channel, from, name, text, data, ts}`, `{t:"config", config}`
+- `{t:"matched", queue, room: <snapshot>}`: you're now in that room. `{t:"mm.cancelled", queue, reason}`
+
+`welcome` also carries `config` and `inbox: {unread}`.
 
 **Session format (v2, optional).** The JS SDK wraps every message in a frame so traffic can move between links:
 - reliable `{"q":<seq>,"a":<ack>,"m":<message>}`, unreliable `{"a":<ack>,"m":<message>}`, ack only `{"a":<ack>}`. `q` counts up from 1 in each direction. `a` is the highest seq received without gaps; resend unacked frames after ~2×RTT on UDP. Deliver reliable messages in `q` order and drop duplicates.
