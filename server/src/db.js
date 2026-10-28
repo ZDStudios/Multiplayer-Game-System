@@ -26,7 +26,23 @@ export function openDb(dir) {
     CREATE TABLE IF NOT EXISTS players (
       game TEXT NOT NULL, id TEXT NOT NULL, name TEXT, first_seen INTEGER NOT NULL,
       last_seen INTEGER NOT NULL, PRIMARY KEY (game, id));
+    CREATE TABLE IF NOT EXISTS boards (
+      game TEXT NOT NULL, id TEXT NOT NULL, config TEXT NOT NULL, created INTEGER NOT NULL, PRIMARY KEY (game, id));
+    CREATE TABLE IF NOT EXISTS friends (
+      game TEXT NOT NULL, player TEXT NOT NULL, other TEXT NOT NULL, state TEXT NOT NULL, -- friend | outgoing | incoming | blocked
+      created INTEGER NOT NULL, PRIMARY KEY (game, player, other));
+    CREATE TABLE IF NOT EXISTS inbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, game TEXT NOT NULL, player TEXT NOT NULL, sender TEXT NOT NULL,
+      sender_name TEXT, type TEXT NOT NULL, data TEXT NOT NULL, created INTEGER NOT NULL, read INTEGER NOT NULL DEFAULT 0);
+    CREATE INDEX IF NOT EXISTS inbox_player ON inbox (game, player, id);
   `);
+  // In-place upgrades for databases created by older versions.
+  const cols = (t) => new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((r) => r.name));
+  const kvCols = cols('kv');
+  if (!kvCols.has('ver')) db.exec('ALTER TABLE kv ADD COLUMN ver INTEGER NOT NULL DEFAULT 1');
+  if (!kvCols.has('expires')) db.exec('ALTER TABLE kv ADD COLUMN expires INTEGER');
+  if (!cols('scores').has('meta')) db.exec('ALTER TABLE scores ADD COLUMN meta TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS kv_expires ON kv (expires) WHERE expires IS NOT NULL');
 
   const q = (sql) => db.prepare(sql);
   const S = {
@@ -72,7 +88,7 @@ export function openDb(dir) {
   };
 
   const purgeGame = (id) => {
-    for (const t of ['kv', 'accounts', 'scores', 'players']) db.prepare(`DELETE FROM ${t} WHERE game = ?`).run(id);
+    for (const t of ['kv', 'accounts', 'scores', 'players', 'boards', 'friends', 'inbox']) db.prepare(`DELETE FROM ${t} WHERE game = ?`).run(id);
     S.gameDelete.run(id);
   };
 

@@ -188,16 +188,50 @@
       this.latency = 0;
       this._samples = new Map(); // playerId -> last two data samples (for predict())
       this._pseen = new Map();   // playerId -> newest fast-lane snapshot seq applied
+      this.config = {};      // remote config from the dashboard (event 'config' when it changes)
+      this.inboxUnread = 0;
+      // Persistent JSON storage. scope: 'player' (yours, readable by anyone) | 'private' (only you) | 'game' (shared).
       this.storage = {
-        get: (key, o = {}) => this.request('kv.get', { key, scope: o.scope, player: o.player }),
-        set: (key, value, o = {}) => this.request('kv.set', { key, value, scope: o.scope }),
-        delete: (key, o = {}) => this.request('kv.del', { key, scope: o.scope }),
-        incr: (key, by = 1, o = {}) => this.request('kv.incr', { key, by, scope: o.scope }),
-        list: (o = {}) => this.request('kv.list', { scope: o.scope, player: o.player, prefix: o.prefix, limit: o.limit }),
+        get: (key, o = {}) => this.request('kv.get', { key, scope: o.scope, player: o.player, meta: o.meta }),
+        getMany: (keys, o = {}) => this.request('kv.getMany', { keys, scope: o.scope, player: o.player, meta: o.meta }),
+        set: (key, value, o = {}) => this.request('kv.set', { key, value, scope: o.scope, ifVersion: o.ifVersion, ttl: o.ttl }),
+        setMany: (entries, o = {}) => this.request('kv.setMany', { entries, scope: o.scope, ttl: o.ttl }),
+        delete: (key, o = {}) => this.request('kv.del', { key, scope: o.scope, ifVersion: o.ifVersion }),
+        incr: (key, by = 1, o = {}) => this.request('kv.incr', { key, by, path: o.path, scope: o.scope }),
+        update: (key, ops, o = {}) => this.request('kv.update', { key, ops, scope: o.scope, ifVersion: o.ifVersion, ttl: o.ttl }),
+        list: (o = {}) => this.request('kv.list', { scope: o.scope, player: o.player, prefix: o.prefix, after: o.after, limit: o.limit }),
+        query: (o = {}) => this.request('kv.query', o),
       };
       this.leaderboard = {
-        submit: (board, score, o = {}) => this.request('lb.submit', { board, score, mode: o.mode }),
-        top: (board, o = {}) => this.request('lb.top', { board, limit: o.limit, order: o.order }),
+        submit: (board, score, o = {}) => this.request('lb.submit', { board, score, meta: o.meta, config: o.config, mode: o.mode }),
+        top: (board, o = {}) => this.request('lb.top', { board, limit: o.limit, offset: o.offset, period: o.period, previous: o.previous }),
+        around: (board, o = {}) => this.request('lb.around', { board, player: o.player, range: o.range, period: o.period, previous: o.previous }),
+        players: (board, players, o = {}) => this.request('lb.players', { board, players, period: o.period, previous: o.previous }),
+        friends: (board, o = {}) => this.request('lb.players', { board, friends: true, period: o.period, previous: o.previous }),
+        boards: () => this.request('lb.boards'),
+      };
+      const who = (p) => (isObj(p) ? p : { player: p }); // playerId or { username }
+      this.friends = {
+        list: () => this.request('friends.list'),
+        request: (p) => this.request('friends.request', who(p)),
+        accept: (p) => this.request('friends.accept', who(p)),
+        remove: (p) => this.request('friends.remove', who(p)),   // unfriend / decline / cancel / unblock
+        block: (p) => this.request('friends.block', who(p)),
+      };
+      this.profiles = {
+        get: (ids) => this.request('players.get', { players: ids }),
+        find: (o) => this.request('players.find', typeof o === 'string' ? { username: o } : o), // 'username' | { name: prefix }
+      };
+      this.inbox = {
+        send: (to, type, data) => this.request('inbox.send', { to, type, data }),
+        list: (o = {}) => this.request('inbox.list', o).then((r) => { this.inboxUnread = r.unread; return r; }),
+        markRead: (ids = 'all') => this.request('inbox.read', { ids }).then((r) => { this.inboxUnread = r.unread; return r; }),
+        delete: (ids) => this.request('inbox.delete', { ids }).then((r) => { this.inboxUnread = r.unread; return r; }),
+      };
+      this.chat = {
+        join: (channel) => this.request('chat.join', { channel }),
+        leave: (channel) => this.request('chat.leave', { channel }),
+        send: (channel, text, data) => this.request('chat.send', { channel, text, data }),
       };
       this.auth = {
         register: async (username, password) => this._setIdentity(await this.request('auth.register', { username, password })),
@@ -266,6 +300,7 @@
           this._connecting = null;
           for (const p of this._pending.values()) { clearTimeout(p.timer); p.reject(new MultiplayerError('disconnected')); }
           this._pending.clear();
+          if (this._mmWait) { this._mmWait.reject(new MultiplayerError('disconnected')); this._mmWait = null; } // tickets die with the connection
           clearInterval(this._pingTimer);
           this._closeLinks();
           const fatal = [4001, 4003, 4004, 4005].includes(ev.code);
@@ -286,6 +321,8 @@
       this.name = m.name;
       this.username = m.username;
       this.game = m.game;
+      this.config = m.config || {};
+      this.inboxUnread = m.inbox ? m.inbox.unread : 0;
       this._store.setItem(this._tokenKey, m.token);
       this._clockOffset = m.serverTime - Date.now();
       this.connected = true;
@@ -585,6 +622,22 @@
           return this._emit('msg:' + m.type, m.data, from, m);
         }
         case 'error': return this._emit('error', new MultiplayerError(m.code, m.message));
+        case 'friend': return this._emit('friend', m);       // { id, name, state: 'incoming'|'friend'|null, online?, status? }
+        case 'presence': return this._emit('presence', m);   // { id, online, status, data }
+        case 'inbox': this.inboxUnread++; return this._emit('inbox', m.item);
+        case 'chat': this._emit('chat', m); return this._emit('chat:' + m.channel, m);
+        case 'config': this.config = m.config || {}; return this._emit('config', this.config);
+        case 'matched': {
+          this._applySnapshot(m.room);
+          const w = this._mmWait; this._mmWait = null;
+          if (w) w.resolve(this.room);
+          return this._emit('matched', this.room, m.queue);
+        }
+        case 'mm.cancelled': {
+          const w = this._mmWait; this._mmWait = null;
+          if (w) w.reject(new MultiplayerError(m.reason || 'cancelled'));
+          return this._emit('matchmakingCancelled', m.queue, m.reason);
+        }
       }
     }
 
@@ -693,6 +746,30 @@
     send(type, data, to, { self = false, unreliable = false } = {}) { return this._fire('send', { type, data, to, self }, unreliable); }
     /** Same as send but resolves when the server accepted it (rejects on error). */
     sendReliable(type, data, to, { self = false } = {}) { return this.request('send', { type, data, to, self }); }
+
+    // ---------- matchmaking ----------
+    /**
+     * Queue for a match; resolves with the room once matched (you're already in it).
+     * o: { size=2, rating=1000, minSize=size, maxWaitMs=30000, spread=100, widen=25, options (room options) }
+     * Players match when their ratings are within `spread`, which grows by `widen` per second of waiting.
+     */
+    async matchmake(queue, o = {}) {
+      if (this._mmWait) this._mmWait.reject(new MultiplayerError('replaced'));
+      const wait = new Promise((resolve, reject) => { this._mmWait = { resolve, reject }; });
+      wait.catch(() => {});
+      try { await this.request('mm.join', Object.assign({}, o, { queue })); } catch (e) { this._mmWait = null; throw e; }
+      return wait;
+    }
+    async cancelMatchmaking() {
+      const w = this._mmWait; this._mmWait = null;
+      await this.request('mm.leave');
+      if (w) w.reject(new MultiplayerError('cancelled'));
+    }
+    matchmakingStatus() { return this.request('mm.status'); }
+
+    // ---------- presence ----------
+    /** What friends see about you: a short status ('in lobby', 'playing ranked') plus small JSON data (≤512 B). */
+    setPresence(status, data) { return this.request('presence.set', { status, data }); }
 
     // ---------- misc ----------
     async setName(name) { const r = await this.request('name', { name }); this.name = r.name; const me = this.me; if (me) me.name = r.name; return r.name; }

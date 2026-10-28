@@ -7,7 +7,10 @@ A self-hosted, game-agnostic multiplayer backend. One Docker stack on your VPS g
 - **Server scripts**: optional authoritative game logic per game, edited in the dashboard. Each hook call has a CPU limit, and a script that crashes or loops forever is stopped without taking the server down. An action costs 1 round trip instead of 2 through a host client.
 - **Best-link transports**: clients connect over WebSocket, then measure WebRTC data channels (browsers) and raw UDP (native/Node) in the background and move all traffic to the fastest link. If that link degrades or dies they switch again, with nothing lost or reordered. There's also an unreliable fast lane for movement.
 - **Low latency**: optimistic state, dead-reckoning `predict()`, connect and join in one round trip, per-player ping in the dashboard, and kernel tuning (`tune-network.sh`).
-- **Persistence (SQLite)**: per-player, private and game-wide key/value storage, atomic counters, persistent rooms, leaderboards, username/password accounts.
+- **Storage (SQLite)**: per-player, private and game-wide JSON storage with versions (compare-and-set), atomic update ops (incr / push / merge / max ...), batches, TTL expiry, queries across all players, quotas, and an optional "server script only" write lock. Persistent rooms too.
+- **Leaderboards**: configurable boards (max / min / sum / last, asc / desc, score bounds), automatic daily / weekly / monthly resets with last period's results, per-score metadata, around-me and friends views, and server-only boards for cheat-proof rankings.
+- **Social and meta-game**: friends (requests, blocking), live presence, player lookup, a persistent inbox for offline players (gifts, invites, rewards), rating-based matchmaking queues, game-wide chat channels with history, and remote config pushed live from the dashboard. Server scripts can use storage, leaderboards and the inbox directly.
+- **Accounts**: optional username/password accounts that keep the same player across devices.
 - **Admin**: one-click shut down / start per game, kick or ban any online player, plus a dashboard (static HTML that runs on GitHub Pages or from the server itself) with live traffic, games, rooms, players, storage browser, leaderboards and broadcasts.
 - **Security**: per-game public keys, an admin bearer token, HMAC-signed player tokens, scrypt passwords, rate limits, message size caps, origin allow-lists, auto-HTTPS via Caddy.
 
@@ -99,7 +102,7 @@ Push the repo, then go to **Settings → Pages → Deploy from branch → `main`
 
 ```bash
 cd server && npm install && npm start     # http://localhost:8080, admin token printed on first run
-npm test                                  # end-to-end smoke test (56 checks, incl. UDP/WebRTC, 30% packet loss, link failover)
+npm test                                  # end-to-end smoke test (80 checks: rooms, storage, leaderboards, social, inbox, matchmaking, chat, UDP/WebRTC, packet loss, failover)
 ```
 
 ## Configuration (`.env`)
@@ -120,9 +123,10 @@ npm test                                  # end-to-end smoke test (56 checks, in
 | `WEBRTC` | `true` | `false` turns off WebRTC |
 | `UDP_HOST` | host the client connected to | Host clients send raw UDP to |
 | `ICE_SERVERS` | – | Comma-separated STUN/TURN URLs for the server's WebRTC peer |
+| `STORAGE_MAX_KEYS` | `1000` | Keys per player per scope (the game scope gets 10×) |
 
 ## Admin REST API
 
 All routes take `Authorization: Bearer ADMIN_TOKEN`.
 
-`GET /api/admin/overview` (includes online players) · `POST /api/admin/games/:id/players/:pid/kick` (`{ban, reason}`) · `POST /api/admin/games/:id/players/:pid/unban` · `GET|POST /api/admin/games` · `GET|PATCH|DELETE /api/admin/games/:id` (PATCH accepts `{name, enabled, rotateKey, settings:{allowedOrigins, gameDataWrite}}`) · `POST /api/admin/games/:id/rooms/:room/close|kick|state` · `POST /api/admin/games/:id/broadcast` · `GET|PUT|DELETE /api/admin/games/:id/kv` · `GET|DELETE /api/admin/games/:id/leaderboards/:board`
+`GET /api/admin/overview` (includes online players) · `POST /api/admin/games/:id/players/:pid/kick` (`{ban, reason}`) · `POST /api/admin/games/:id/players/:pid/unban` · `GET /api/admin/games/:id/leaderboards` · `GET|DELETE /api/admin/games/:id/leaderboards/:board` (`?period=day&previous=1`; DELETE resets every period, `?config=delete` also drops the config) · `GET|PUT /api/admin/games/:id/leaderboards/:board/config` (`{mode, sort, periods, clientWrite, min, max}`) · `POST /api/admin/games/:id/leaderboards/:board/submit` (`{player, score, meta}`) · `DELETE /api/admin/games/:id/leaderboards/:board/players/:pid` · `POST /api/admin/games/:id/inbox` (`{to: id | [ids], type, data}`) · `GET|POST /api/admin/games` · `GET|PATCH|DELETE /api/admin/games/:id` (PATCH accepts `{name, enabled, rotateKey, settings:{allowedOrigins, gameDataWrite, playerDataWrite, lockLeaderboards, inboxClientSend, config}}`; changing `config` pushes it to every connected client) · `POST /api/admin/games/:id/rooms/:room/close|kick|state` · `POST /api/admin/games/:id/broadcast` · `GET|PUT|DELETE /api/admin/games/:id/kv` · `GET|DELETE /api/admin/games/:id/leaderboards/:board`

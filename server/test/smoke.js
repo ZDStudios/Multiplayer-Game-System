@@ -177,6 +177,140 @@ try {
   assert.ok((await api('GET', '/overview')).body.players.some((p) => typeof p.rtt === 'number')); ok('server measures per-player RTT');
   for (const x of [o1, o2, s1, s2]) x.disconnect();
 
+  // ---- game services ----
+  const mk = async (name, o = {}) => { const x = new Multiplayer({ url: BASE, key: game.key, name, transports: ['websocket'], ...o }); await x.connect(); return x; };
+  const x1 = await mk('Xena'), x2 = await mk('Xavier'), x3 = await mk('Xolo');
+
+  // storage: versions / compare-and-set
+  assert.deepEqual(await x1.storage.set('deck', [1, 2]), { version: 1 });
+  assert.deepEqual(await x1.storage.set('deck', [1, 2, 3], { ifVersion: 1 }), { version: 2 });
+  await assert.rejects(x1.storage.set('deck', [], { ifVersion: 1 }), /version/);
+  await assert.rejects(x1.storage.set('deck', [], { ifVersion: 0 }), /version/);
+  assert.equal((await x1.storage.get('deck', { meta: true })).version, 2); ok('storage: versions + compare-and-set');
+  const upd = await x1.storage.update('inv', [['incr', 'coins', 5], ['push', 'log', 'a', 2], ['push', 'log', 'b', 2], ['push', 'log', 'c', 2],
+    ['addToSet', 'tags', 'x'], ['addToSet', 'tags', 'x'], ['merge', 'stats', { hp: 10 }], ['max', 'best', 7], ['max', 'best', 3], ['set', 'gone', 1], ['unset', 'gone']]);
+  assert.deepEqual(upd.value, { coins: 5, log: ['b', 'c'], tags: ['x'], stats: { hp: 10 }, best: 7 });
+  assert.equal(await x1.storage.incr('inv', 2, { path: 'coins' }), 7); ok('storage: atomic update ops (incr/push cap/addToSet/merge/max/unset)');
+  await x1.storage.setMany({ a: 1, b: { c: 2 } }, { scope: 'private' });
+  assert.deepEqual(await x1.storage.getMany(['a', 'b', 'zz'], { scope: 'private' }), { a: 1, b: { c: 2 }, zz: null }); ok('storage: setMany / getMany');
+  await x1.storage.set('temp', 'x', { ttl: 1 });
+  assert.equal(await x1.storage.get('temp'), 'x');
+  await sleep(1100);
+  assert.equal(await x1.storage.get('temp'), null);
+  assert.deepEqual(await x1.storage.set('temp', 'y', { ifVersion: 0 }), { version: 1 }); ok('storage: TTL expiry (expired keys count as missing)');
+  await x1.storage.set('profile', { level: 3, region: 'au' });
+  await x2.storage.set('profile', { level: 7, region: 'au' });
+  await x3.storage.set('profile', { level: 9, region: 'eu' });
+  const found = await x1.storage.query({ key: 'profile', where: [['level', '>=', 5], ['region', '=', 'au']] });
+  assert.deepEqual(found.map((r) => [r.player, r.name]), [[x2.playerId, 'Xavier']]);
+  const byLevel = await x1.storage.query({ key: 'profile', orderBy: 'level', desc: true, limit: 2 });
+  assert.deepEqual(byLevel.map((r) => r.value.level), [9, 7]);
+  await assert.rejects(x1.storage.query({ scope: 'private' }), /scope/);
+  await assert.rejects(x1.storage.query({ where: [["level') OR 1=1 --", '=', 1]] }), /path/); ok('storage: query across players (filters, order, no private, injection-safe paths)');
+  await api('PATCH', `/games/${game.id}`, { settings: { playerDataWrite: 'none' } });
+  await assert.rejects(x1.storage.set('cheat', 1), { code: 'forbidden' });
+  await api('PATCH', `/games/${game.id}`, { settings: { playerDataWrite: 'all' } }); ok('storage: playerDataWrite=none locks client writes');
+
+  // leaderboards
+  const sub = await x1.leaderboard.submit('daily_runs', 120, { meta: { char: 'mage' }, config: { periods: ['day', 'week'] } });
+  assert.equal(sub.rank, 1); assert.equal(sub.periods.day.rank, 1); assert.equal(sub.periods.week.score, 120);
+  await x2.leaderboard.submit('daily_runs', 90);
+  const dTop = await x2.leaderboard.top('daily_runs', { period: 'day' });
+  assert.deepEqual(dTop.entries.map((e) => [e.name, e.score]), [['Xena', 120], ['Xavier', 90]]);
+  assert.deepEqual(dTop.entries[0].meta, { char: 'mage' }); assert.equal(dTop.me.rank, 2); assert.ok(dTop.resetsAt > Date.now());
+  assert.equal((await x2.leaderboard.top('daily_runs', { period: 'day', previous: true })).entries.length, 0);
+  await assert.rejects(x1.leaderboard.top('daily_runs', { period: 'month' }), { code: 'bad_period' }); ok('leaderboards: periods (day/week), meta, resetsAt, previous period');
+  await x1.leaderboard.submit('laps', 65.2, { config: { mode: 'min' } });
+  await x2.leaderboard.submit('laps', 61.9);
+  await x1.leaderboard.submit('laps', 70);
+  assert.deepEqual((await x1.leaderboard.top('laps')).entries.map((e) => e.score), [61.9, 65.2]); ok('leaderboards: min mode sorts ascending, keeps best');
+  for (let i = 0; i < 10; i++) await api('POST', `/games/${game.id}/leaderboards/speed/submit`, { player: 'p_bot' + i, score: i * 10 });
+  await x3.leaderboard.submit('speed', 45);
+  const ar = await x3.leaderboard.around('speed', { range: 2 });
+  assert.equal(ar.me.rank, 6); assert.deepEqual(ar.entries.map((e) => e.score), [60, 50, 45, 40, 30]); ok('leaderboards: around-me window');
+  await api('PUT', `/games/${game.id}/leaderboards/ranked/config`, { clientWrite: false, min: 0, max: 5000 });
+  await assert.rejects(x1.leaderboard.submit('ranked', 10), { code: 'forbidden' });
+  await assert.rejects(api('POST', `/games/${game.id}/leaderboards/ranked/submit`, { player: x1.playerId, score: 99999 }).then((r) => { if (r.status !== 200) throw new Error(r.body.error); }), /bad_score/);
+  ok('leaderboards: server-only boards + score bounds');
+  assert.ok((await x1.leaderboard.boards()).some((b) => b.id === 'daily_runs' && b.periods.includes('week'))); ok('leaderboards: list board configs');
+
+  // social
+  const inc = new Promise((r) => x2.once('friend', r));
+  assert.equal((await x1.friends.request(x2.playerId)).state, 'outgoing');
+  assert.equal((await inc).state, 'incoming');
+  const acc = new Promise((r) => x1.once('friend', r));
+  assert.equal((await x2.friends.accept(x1.playerId)).state, 'friend');
+  assert.equal((await acc).state, 'friend');
+  const fl = await x1.friends.list();
+  assert.equal(fl[0].id, x2.playerId); assert.equal(fl[0].online, true); ok('friends: request -> incoming event -> accept');
+  const pres = new Promise((r) => x1.once('presence', r));
+  await x2.setPresence('in lobby', { map: 'arena' });
+  assert.deepEqual(await pres, { t: 'presence', id: x2.playerId, online: true, status: 'in lobby', data: { map: 'arena' } }); ok('presence: friends see status changes');
+  assert.equal((await x1.leaderboard.friends('daily_runs', { period: 'day' })).entries.length, 2); ok('leaderboards: friends view');
+  const prof = await x1.profiles.get([x2.playerId, x3.playerId]);
+  assert.equal(prof[0].status, 'in lobby'); assert.equal(prof[1].status, undefined); // presence is friends-only
+  assert.equal((await x1.profiles.find({ name: 'Xol' }))[0].id, x3.playerId); ok('profiles: lookup + name search');
+  await x3.friends.block(x1.playerId);
+  await assert.rejects(x1.send('dm', 1, x3.playerId) && x1.sendReliable('dm', 1, x3.playerId), /blocked/);
+  assert.deepEqual(await x1.inbox.send(x3.playerId, 'gift', 1), { id: null }); ok('block: DMs refused, inbox silently dropped');
+
+  // inbox
+  const mail = new Promise((r) => x2.once('inbox', r));
+  await x1.inbox.send(x2.playerId, 'gift', { gold: 50 });
+  assert.deepEqual((await mail).data, { gold: 50 });
+  const box = await x2.inbox.list();
+  assert.equal(box.unread, 1); assert.equal(box.items[0].fromName, 'Xena');
+  assert.equal((await x2.inbox.markRead()).unread, 0); ok('inbox: live delivery, list, mark read');
+  x2.disconnect();
+  await waitFor(async () => (await x1.friends.list())[0].online === false); ok('presence: friends see you go offline');
+  await x1.inbox.send(x2.playerId, 'invite', { room: 'ABC' });
+  await x2.connect();
+  assert.equal(x2.inboxUnread, 1); ok('inbox: messages wait for offline players');
+
+  // chat channels
+  await x1.chat.join('global'); await x2.chat.join('global');
+  const said = new Promise((r) => x2.once('chat:global', r));
+  await x1.chat.send('global', 'hello world');
+  const cm = await said;
+  assert.equal(cm.text, 'hello world'); assert.equal(cm.name, 'Xena');
+  assert.equal((await x3.chat.join('global')).history.length, 0); // x3 blocked x1: x1's history is hidden
+  assert.equal((await (await mk('Late')).chat.join('global')).history[0].text, 'hello world'); ok('chat: channels, history, block filter');
+
+  // matchmaking
+  const m1 = await mk('M1'), m2 = await mk('M2'), m3 = await mk('M3');
+  const p3 = m3.matchmake('duel', { rating: 3000 });
+  const [r1, r2] = await Promise.all([m1.matchmake('duel', { rating: 1000 }), m2.matchmake('duel', { rating: 1050 })]);
+  assert.equal(r1.id, r2.id); assert.equal(m1.players.size, 2); assert.ok(r1.private);
+  assert.equal((await m3.matchmakingStatus()).queue, 'duel');
+  const cancelled = assert.rejects(p3, /cancelled/);
+  await m3.cancelMatchmaking(); await cancelled; ok('matchmaking: close ratings match into one room, far rating waits, cancel');
+  const t0 = Date.now();
+  const [sq1, sq2] = await Promise.all([m1.matchmake('squad', { size: 4, minSize: 2, maxWaitMs: 300 }), m3.matchmake('squad', { size: 4, minSize: 2, maxWaitMs: 300 })]);
+  assert.equal(sq1.id, sq2.id); assert.ok(Date.now() - t0 >= 250); ok('matchmaking: starts with minSize after maxWaitMs');
+
+  // remote config
+  const cfgEv = new Promise((r) => x1.once('config', r));
+  await api('PATCH', `/games/${game.id}`, { settings: { config: { motd: 'Season 2!', maxSpeed: 5 } } });
+  assert.equal((await cfgEv).motd, 'Season 2!');
+  assert.equal((await mk('Cfg')).config.maxSpeed, 5); ok('remote config: pushed live + in welcome');
+
+  // server script uses the services
+  await api('PUT', `/games/${game.id}/script`, { code: `module.exports = { onMessage(room, p, type) {
+    if (type !== 'win') return;
+    const w = room.storage.update('stats', [['incr', 'wins', 1]], { player: p.id });
+    room.leaderboard.submit(p.id, 'ranked', w.value.wins * 100);
+    room.inbox.send(p.id, 'reward', { wins: w.value.wins });
+  } };` });
+  const sc = await mk('Scripted');
+  await sc.join('SVC');
+  const rew = new Promise((r) => sc.once('inbox', r));
+  sc.send('win', null, 'server');
+  assert.deepEqual((await rew).data, { wins: 1 });
+  assert.deepEqual(await sc.storage.get('stats'), { wins: 1 });
+  assert.equal((await sc.leaderboard.top('ranked')).me.score, 100); ok('server script: storage + server-only leaderboard + inbox');
+  await api('DELETE', `/games/${game.id}/script`);
+  for (const x of [x1, x2, x3, m1, m2, m3, sc]) x.disconnect();
+
   // ---- transports ----
   const tw = new Multiplayer({ url: BASE, key: game.key, transports: ['websocket'] });
   await tw.connect({ room: 'NET' });

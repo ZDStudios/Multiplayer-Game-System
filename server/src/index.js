@@ -10,6 +10,7 @@ import { WebSocketServer } from 'ws';
 import { openDb } from './db.js';
 import { createScripting } from './scripts.js';
 import { createTransports } from './transports.js';
+import { createServices } from './services.js';
 
 const scrypt = promisify(crypto.scrypt);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -263,7 +264,9 @@ function joinRoom(c, id, o = {}) {
   pickHost(room);
   return snapshot(room);
 }
-const scripts = createScripting({ log, broadcast, send, setPath, removeMember, pubPlayer, E });
+const services = createServices({ db: store.db, E, online, rkey, send, out, isObj, str, safeMerge, ID_RE, KEY_RE, BAD_KEYS, CFG,
+  newCode, joinRoom, snapshot });
+const scripts = createScripting({ log, broadcast, send, setPath, removeMember, pubPlayer, E, services });
 for (const g of games.values()) if (g.settings.script) scripts.load(g);
 
 function onDisconnect(c) {
@@ -285,31 +288,6 @@ function publicRooms(game, tag) {
     out.push({ ...roomInfo(r), players: r.players.size });
   }
   return out;
-}
-
-// ---------- kv helpers ----------
-const SCOPES = new Set(['player', 'game', 'private']);
-function kvTarget(c, m, write) {
-  const scope = m.scope || 'player';
-  if (!SCOPES.has(scope)) throw new E('bad_scope', 'scope must be player | game | private');
-  const key = m.key;
-  if (typeof key !== 'string' || !KEY_RE.test(key)) throw new E('bad_key');
-  if (scope === 'game') {
-    if (write && c.game.settings.gameDataWrite === 'none') throw new E('forbidden', 'Game data is read-only for clients');
-    return [scope, '', key];
-  }
-  if (scope === 'player' && !write && m.player != null) {
-    if (!ID_RE.test(m.player)) throw new E('bad_player');
-    return [scope, m.player, key];
-  }
-  return [scope, c.pid, key];
-}
-const parse = (row) => (row ? JSON.parse(row.v) : null);
-function kvPut(gid, scope, owner, key, value) {
-  if (value === undefined) throw new E('bad_value');
-  const s = JSON.stringify(value);
-  if (s.length > CFG.maxMsg) throw new E('too_large');
-  S.kvSet.run(gid, scope, owner, key, s, Date.now());
 }
 
 // ---------- message handlers ----------
@@ -405,6 +383,7 @@ const H = {
       if (typeof to !== 'string') throw new E('not_in_room');
       const target = online.get(rkey(c.game.id, to));
       if (!target) throw new E('player_offline');
+    if (target.blocked && target.blocked.has(c.pid)) throw new E('blocked');
       msg.direct = true;
       send(target, msg, unreliable);
       return true;
@@ -422,52 +401,6 @@ const H = {
       if (t && t.client) send(t.client, msg, unreliable);
     }
     return true;
-  },
-
-  'kv.get'(c, m) { const [s, o, k] = kvTarget(c, m, false); return parse(S.kvGet.get(c.game.id, s, o, k)); },
-  'kv.set'(c, m) { const [s, o, k] = kvTarget(c, m, true); kvPut(c.game.id, s, o, k, m.value); return true; },
-  'kv.del'(c, m) { const [s, o, k] = kvTarget(c, m, true); S.kvDel.run(c.game.id, s, o, k); return true; },
-  'kv.incr'(c, m) {
-    const [s, o, k] = kvTarget(c, m, true);
-    const by = m.by == null ? 1 : +m.by;
-    if (!Number.isFinite(by)) throw new E('bad_value');
-    const cur = parse(S.kvGet.get(c.game.id, s, o, k));
-    const next = (typeof cur === 'number' ? cur : 0) + by;
-    kvPut(c.game.id, s, o, k, next);
-    return next;
-  },
-  'kv.list'(c, m) {
-    const [s, o] = kvTarget(c, { ...m, key: 'x' }, false);
-    const prefix = str(m.prefix, 128, '');
-    const rows = S.kvList.all(c.game.id, s, o, prefix, prefix + '￿', Math.min(+m.limit || 100, 500));
-    return rows.map((r) => ({ key: r.k, value: JSON.parse(r.v), updated: r.updated }));
-  },
-
-  'lb.submit'(c, m) {
-    const board = str(m.board, 64, '');
-    const score = +m.score;
-    if (!board || !Number.isFinite(score)) throw new E('bad_score');
-    const mode = m.mode || 'max';
-    const cur = S.scoreGet.get(c.game.id, board, c.pid);
-    let next = score;
-    if (cur) {
-      if (mode === 'max') next = Math.max(cur.score, score);
-      else if (mode === 'min') next = Math.min(cur.score, score);
-      else if (mode === 'sum') next = cur.score + score;
-    }
-    S.scoreSet.run(c.game.id, board, c.pid, c.name, next, Date.now());
-    const asc = mode === 'min';
-    const rank = (asc ? S.scoreRankAsc : S.scoreRankDesc).get(c.game.id, board, next).r;
-    return { score: next, rank, improved: !cur || next !== cur.score };
-  },
-  'lb.top'(c, m) {
-    const board = str(m.board, 64, '');
-    const asc = m.order === 'asc';
-    const limit = Math.max(1, Math.min(+m.limit || 10, 100));
-    const entries = (asc ? S.scoreTopAsc : S.scoreTopDesc).all(c.game.id, board, limit).map((e, i) => ({ rank: i + 1, ...e }));
-    const mine = S.scoreGet.get(c.game.id, board, c.pid);
-    const me = mine ? { score: mine.score, rank: (asc ? S.scoreRankAsc : S.scoreRankDesc).get(c.game.id, board, mine.score).r } : null;
-    return { board, entries, me };
   },
 
   async 'auth.register'(c, m) {
@@ -497,14 +430,17 @@ const H = {
     if (acc.player !== c.pid) {
       if (c.room) removeMember(c.room, c.pid, 'left');
       online.delete(rkey(c.game.id, c.pid));
+      services.onOffline(c);
       claimIdentity(c, acc.player);
       const row = S.playerGet.get(c.game.id, acc.player);
       if (row && row.name) c.name = row.name;
+      services.onOnline(c);
     }
     c.username = u;
     return { playerId: c.pid, token: makeToken(c.game.id, c.pid), username: u, name: c.name };
   },
 };
+Object.assign(H, services.handlers);
 
 function claimIdentity(c, pid) {
   const k = rkey(c.game.id, pid);
@@ -534,7 +470,8 @@ function hello(c, m) {
   gameStats.get(game.id).lastActive = Date.now();
   send(c, { t: 'welcome', playerId: pid, token: makeToken(game.id, pid), name: c.name, username: c.username,
     serverTime: Date.now(), game: { id: game.id, name: game.name }, returning: !!row,
-    transports: c.session ? net.offer(c) : undefined });
+    transports: c.session ? net.offer(c) : undefined, ...services.welcomeExtras(c) });
+  services.onOnline(c);
   if (!row) log(game.id, 'player', `New player ${c.name}`);
 }
 
@@ -627,7 +564,7 @@ async function admin(req, res, parts, url) {
     return json(res, 200, {
       server: { uptime: Date.now() - started, started, node: process.version, rss: mem.rss, heap: mem.heapUsed,
         connections: conns.size, online: online.size, rooms: rooms.size, msgIn: stats.in, msgOut: stats.out,
-        bytesIn: stats.bytesIn, bytesOut: stats.bytesOut, openGames: CFG.openGames, transports: net.info() },
+        bytesIn: stats.bytesIn, bytesOut: stats.bytesOut, openGames: CFG.openGames, transports: net.info(), ...services.stats() },
       players: [...online.values()].slice(0, 500).map((c) => ({ game: c.game.id, gameName: c.game.name, id: c.pid, name: c.name,
         username: c.username, room: c.room ? c.room.id : null, since: c.since, rtt: c.rtt, transport: net.active(c) })),
       history: stats.history, games: [...games.values()].map((g) => gameSummary(g, counts)), events: events.slice(-100).reverse(),
@@ -658,7 +595,11 @@ async function admin(req, res, parts, url) {
         g.enabled = !!b.enabled;
         if (!g.enabled) for (const c of [...online.values()]) if (c.game === g) c.ws.close(4004, 'game_disabled');
       }
-      if (isObj(b.settings)) g.settings = safeMerge(g.settings, b.settings);
+      if (isObj(b.settings)) {
+        if (b.settings.config !== undefined && b.settings.config !== null && !isObj(b.settings.config)) throw new E('bad_data', 'settings.config must be an object');
+        g.settings = safeMerge(g.settings, b.settings);
+        if ('config' in b.settings) services.pushConfig(g, online.values()); // remote config goes live at once
+      }
       if (b.rotateKey) { gamesByKey.delete(g.key); g.key = 'pk_' + rid(18); gamesByKey.set(g.key, g); }
       saveGame(g);
       log(g.id, 'game', `Game updated: ${g.name}`);
@@ -670,7 +611,7 @@ async function admin(req, res, parts, url) {
       rooms: [...rooms.values()].filter((r) => r.game === g).map((r) => ({ ...roomInfo(r), persist: r.persist,
         players: [...r.players.values()].map((m) => ({ ...pubPlayer(m), rtt: rttOf(m), transport: m.client ? net.active(m.client) : null, data: trunc(m.data, 2000) })), state: trunc(r.state) })),
       recentPlayers: S.playersRecent.all(g.id, 50).map((p) => ({ ...p, online: online.has(rkey(g.id, p.id)) })),
-      leaderboards: S.scoreBoards.all(g.id),
+      leaderboards: services.summary(g.id), ...services.stats(g.id),
     });
   }
   if (sub === 'rooms' && sid && method === 'POST') {
@@ -740,12 +681,20 @@ async function admin(req, res, parts, url) {
     const b = await readBody(req);
     const scope = str(b.scope, 16, 'game'), owner = str(b.owner, 64, ''), key = str(b.key, 128, '');
     if (!key) throw new E('bad_key');
-    if (method === 'PUT') { kvPut(g.id, scope, owner, key, b.value); return json(res, 200, { ok: true }); }
+    if (method === 'PUT') { services.storage.put(g.id, scope, owner, key, b.value); return json(res, 200, { ok: true }); }
     if (method === 'DELETE') { S.kvDel.run(g.id, scope, owner, key); return json(res, 200, { ok: true }); }
   }
-  if (sub === 'leaderboards' && sid) {
-    if (method === 'DELETE') { S.scoreDelBoard.run(g.id, sid); return json(res, 200, { ok: true }); }
-    return json(res, 200, S.scoreTopDesc.all(g.id, sid, 100));
+  if (sub === 'leaderboards') {
+    const b = method === 'PUT' || method === 'POST' ? await readBody(req) : {};
+    return json(res, 200, services.adminLeaderboards(g, method, sid, act, parts[7], b, url));
+  }
+  if (sub === 'inbox' && method === 'POST') { // { to: playerId | [ids], type, data }
+    const b = await readBody(req);
+    const to = Array.isArray(b.to) ? b.to.slice(0, 1000) : [b.to];
+    let n = 0;
+    for (const id of to) { try { services.inbox.send(g.id, id, 'server', 'server', b.type, b.data); n++; } catch (e) { if (to.length === 1) throw e; } }
+    log(g.id, 'admin', `Inbox "${str(b.type, 64, 'message')}" sent to ${n} player(s)`);
+    return json(res, 200, { ok: true, delivered: n });
   }
   throw new E('not_found');
 }
@@ -820,6 +769,7 @@ wss.on('connection', (ws, req) => {
     if (left) ipConns.set(ip, left); else ipConns.delete(ip);
     if (!c.game) return;
     if (online.get(rkey(c.game.id, c.pid)) === c) online.delete(rkey(c.game.id, c.pid));
+    services.onOffline(c);
     onDisconnect(c);
   });
   ws.on('error', () => {});
