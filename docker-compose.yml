@@ -5,9 +5,14 @@ services:
     env_file: .env
     environment:
       TRUST_PROXY: "true"
+      UDP_PORT: "8081"
+      RTC_PORT: "8082"
     volumes:
       - mp-data:/data
     expose: ["8080"]
+    # UDP transports go straight to the container (Caddy/Traefik only proxy HTTP + WebSocket):
+    # 8081 = raw UDP for native/Node clients, 8082 = WebRTC data channels (ICE UDP mux, one port for all peers).
+    ports: ["8081:8081/udp", "8082:8082/udp"]
     # Uncomment to also expose directly (e.g. no domain yet / own reverse proxy):
     # ports: ["8080:8080"]
 

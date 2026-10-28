@@ -9,6 +9,11 @@
     "start": "node --disable-warning=ExperimentalWarning src/index.js",
     "test": "node --disable-warning=ExperimentalWarning test/smoke.js"
   },
-  "engines": { "node": ">=22.13" },
-  "dependencies": { "ws": "^8.18.0" }
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "node-datachannel": "^0.33.4",
+    "ws": "^8.18.0"
+  }
 }

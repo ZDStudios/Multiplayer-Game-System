@@ -48,7 +48,10 @@
   const mp = window.mp = new Multiplayer({ url: SERVER, key: KEY, name: 'Guest' + Math.floor(Math.random() * 1000) }); // window.mp for console poking
   const chat = (html) => { $('#chat').insertAdjacentHTML('beforeend', `<div>${html}</div>`); $('#chat').scrollTop = 1e9; };
 
-  mp.on('connected', () => { $('#status').textContent = `· ${mp.name}`; });
+  const status = () => { $('#status').textContent = `· ${mp.name} · ${mp.transport} ${mp.latency} ms`; };
+  mp.on('connected', status);
+  mp.on('ping', status);
+  mp.on('transport', (now, prev) => { status(); chat(`<i class="mute">link: ${prev} → ${now}</i>`); });
   mp.on('reconnecting', () => { $('#status').textContent = '· reconnecting…'; });
   mp.on('joined', (room) => { $('#roomInfo').textContent = `Room ${room.id} — share this code`; location.hash = `key=${KEY}&room=${room.id}`; chat(`<i class="mute">joined ${room.id}</i>`); });
   mp.on('playerJoined', (p) => chat(`<i class="mute">${esc(p.name)} joined</i>`));
@@ -86,7 +89,7 @@
   $('#newBtn').onclick = () => mp.create({ maxPlayers: 12 });
   $('#chatForm').onsubmit = (e) => { e.preventDefault(); const text = $('#msg').value.trim(); if (!text) return; mp.send('chat', { text }, 'all', { self: true }); $('#msg').value = ''; };
 
-  // ---- input + movement (own position applied locally, sent at 20Hz) ----
+  // ---- input + movement (own position applied locally, sent at 30Hz on the fast lane) ----
   const cv = $('#cv'), ctx = cv.getContext('2d'), keys = {};
   let target = null, scale = 1, ox = 0, oy = 0;
   addEventListener('keydown', (e) => { if (e.target.tagName !== 'INPUT') keys[e.key.toLowerCase()] = true; });
@@ -104,7 +107,7 @@
       const len = Math.hypot(dx, dy) || 1;
       x = Math.max(15, Math.min(W - 15, x + (dx / len) * 5)); y = Math.max(15, Math.min(H - 15, y + (dy / len) * 5));
       me.data.x = x; me.data.y = y;
-      if (t - lastSend > 33 && (dx || dy)) { lastSend = t; mp.setPlayer({ x: Math.round(x), y: Math.round(y) }); }
+      if (t - lastSend > 33 && (dx || dy)) { lastSend = t; mp.setPlayer({ x: Math.round(x), y: Math.round(y) }, { unreliable: true }); }
       for (const [id, c] of Object.entries(mp.state.coins || {})) if (Math.hypot(x - c.x, y - c.y) < 30 && !c._asked) { c._asked = 1; mp.send('pickup', id, 'host', { self: true }); }
     }
     cv.width = cv.clientWidth * devicePixelRatio; cv.height = cv.clientHeight * devicePixelRatio;

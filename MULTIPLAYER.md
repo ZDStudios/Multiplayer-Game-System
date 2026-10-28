@@ -84,8 +84,25 @@ new Multiplayer({
   autoReconnect: true,
   timeout: 10000,           // request timeout (ms)
   WebSocket: undefined,     // custom implementation if needed
+  transports: ['webrtc', 'udp', 'websocket'],  // links the SDK may use (see "Transports" below)
+  RTCPeerConnection: undefined,  // Node only: WebRTC implementation, e.g. require('node-datachannel/polyfill').RTCPeerConnection
+  iceServers: [],           // STUN/TURN for WebRTC; rarely needed (the server has a public IP)
+  probeInterval: 1000,      // ms between background link measurements once settled
 })
 ```
+
+### Transports
+The SDK connects over **WebSocket** first, so `connect()` is never slower than before. In the background it opens the other links the server offers and measures RTT, jitter and loss on all of them: every 100 ms for the first ~1.5 s, then every `probeInterval`. All traffic moves to the best-scoring link, and the measuring never stops. If that link degrades or dies, traffic moves again, back to WebSocket if needed. Nothing is lost or reordered across a switch: every reliable message carries a sequence number and is resent until acknowledged.
+
+| Link | Where | Notes |
+|---|---|---|
+| `webrtc` | Browsers; Node with `RTCPeerConnection` passed in | Data channels to the server: one ordered+reliable, one unordered with no retransmits. Signalling runs over the WebSocket. |
+| `udp` | Node, native engines | Raw UDP datagrams. Browsers can't open UDP sockets, so they use `webrtc` (which is UDP underneath). |
+| `websocket` | Everywhere | TCP. Always open: it's the signalling channel and the fallback. |
+
+`mp.transport` is the link in use. `mp.transportStats` holds live numbers for each link (`{ open, rtt, jitter, loss, samples }`). The `transport` event fires `(now, previous, stats)` on every switch, and `transportFailed` fires `(kind)` when a link can't be opened (it's retried with backoff). Pass `transports: ['websocket']` to turn the extra links off.
+
+**Fast lane (unreliable).** Everything is reliable and ordered by default, whatever the link. For data you resend every frame anyway, use `{ unreliable: true }`. On WebRTC and UDP it skips resends and head-of-line blocking; on WebSocket it changes nothing. See `setPlayer` and `send` below.
 
 ### Connection
 | Call | Notes |
@@ -123,14 +140,16 @@ new Multiplayer({
 **Optimistic by default.** Your own writes apply to `mp.state` immediately (a `state` event fires with `{optimistic: true}`). Other clients get them about half an RTT later. The server still decides the order: if someone else's write lands first, your copy is reconciled automatically. If the write is rejected (`not_host`, or the room is server-authoritative), the promise rejects and `mp.state` rolls back to the server's version (`mp.resync()`). Turn it off with `new Multiplayer({ optimistic: false })`. For high-frequency data (60 Hz positions) use `setPlayer`, not `setState`.
 
 ### Per-player data
-`mp.setPlayer({x, y, hp: null /*null deletes*/}, {replace=false})` is fire-and-forget. It's applied to `mp.me.data` immediately and merged into `player.data` on other clients. Send at 20–30 Hz (at most 60 messages/s total per client), and only changed fields.
+`mp.setPlayer({x, y, hp: null /*null deletes*/}, {replace=false, unreliable=false})` is fire-and-forget. It's applied to `mp.me.data` immediately and merged into `player.data` on other clients. Send at 20–30 Hz (at most 60 messages/s total per client), and only changed fields.
+
+For movement, use `mp.setPlayer({ x, y }, { unreliable: true })`. Each update then sends your **whole** player data with a sequence number on the fast lane, so a lost or late packet is simply replaced by the next one. A reliable copy goes out ~150 ms after the last update, so the final value always arrives. Keep player data small (under ~1 KB) when you use this.
 
 `mp.predict(playerId, keys = ['x','y'], {maxAheadMs: 250})` does dead reckoning for **remote** players. It returns `{x, y}` extrapolated to "now" from the velocity between their last two updates plus half your ping. Render remote players at `predict()` (lerp toward it for smoothness), not at raw `p.data`. Raw data is always about one-way latency + send interval old.
 
 ### Messages
 | Call | Notes |
 |---|---|
-| `mp.send(type, data, to?, {self})` | Fire-and-forget. `to`: omitted for everyone except me, `'all'`, `'host'`, `'server'` (the game's server script, §5b), a playerId, or an array of ids. Pass `{self:true}` with `'all'` to receive your own message too. |
+| `mp.send(type, data, to?, {self, unreliable})` | Fire-and-forget. `to`: omitted for everyone except me, `'all'`, `'host'`, `'server'` (the game's server script, §5b), a playerId, or an array of ids. Pass `{self:true}` with `'all'` to receive your own message too. `{unreliable:true}` sends it on the fast lane: it may be dropped or arrive out of order, so only use it for things sent every frame (inputs, aim). |
 | `await mp.sendReliable(...)` | Same arguments, but resolves when the server accepts it. |
 | `mp.onMessage(type, (data, fromId, raw) => {})` | `fromId === 'server'` for admin broadcasts (type `announcement` by default). |
 | Outside a room | `mp.send('invite', {room: 'ABC123'}, playerId)` sends a direct message to any online player of the game. |
@@ -190,6 +209,8 @@ Logging in leaves the current room. Rejoin afterwards. A login kicks any other a
 | `msg:<type>` | Same as `onMessage(type, ...)`. |
 | `error` | `MultiplayerError {code, message}`. Async errors such as `rate_limited` or `replaced`. |
 | `ping` | `latency` |
+| `transport` | `(now, previous, stats)`. Traffic moved to another link. |
+| `transportFailed` | `(kind)`. A link couldn't be opened (retried with backoff). |
 
 Request errors reject with `MultiplayerError` (`err.code`): `not_connected`, `timeout`, `not_in_room`, `not_host`, `room_full`, `room_locked`, `room_not_found`, `bad_password`, `banned`, `bad_path`, `bad_key`, `bad_scope`, `forbidden`, `too_large`, `username_taken`, `bad_credentials`, `already_registered`, `player_offline`, `no_server_script`.
 
@@ -237,7 +258,7 @@ Techniques, all expected for action games:
 1. **Client-side prediction.** Apply your own actions locally the moment the input happens (move, shoot animation, sound), then reconcile when the authoritative state arrives.
 2. **Dead reckoning.** Render remote players at `mp.predict(id)`, not raw data.
 3. **Server scripts** for authority instead of the host (1 RTT instead of 2).
-4. **Send rate.** Use `setPlayer` at 20–30 Hz with small payloads (round numbers and short keys). Don't send unchanged data.
+4. **Send rate.** Use `setPlayer` at 20–30 Hz with small payloads (round numbers and short keys). Don't send unchanged data. Pass `{ unreliable: true }` for movement so a lost packet never holds up newer ones.
 5. **One-RTT start.** Use `connect({ quickJoin | room | create })`.
 6. **Shared clock.** Use `mp.serverTime()` for anything timed, such as countdowns, cooldowns and projectile spawn times, so clients agree regardless of latency.
 
@@ -325,7 +346,7 @@ module.exports = {
 
 ## 8. Wire protocol (for non-JS engines)
 
-WebSocket `wss://HOST/ws`. Messages are text frames of JSON objects with a type field `t`.
+WebSocket `wss://HOST/ws`. Messages are text frames of JSON objects with a type field `t`. This plain format (protocol v1) is always supported and is all you need to start. The optional session format (v2, which adds WebRTC/UDP) is at the end of this section.
 
 1. On open, send `{"t":"hello","key":"GAME_KEY","token":"<saved token or omit>","name":"Bob"}`.
 2. The server replies `{"t":"welcome","playerId","token","name","username","serverTime","game":{id,name},"returning"}`. **Persist `token`** and send it on the next hello to stay the same player.
@@ -358,7 +379,15 @@ Server pushes:
 - `{t:"msg", type, data, from, direct?}`
 - `{t:"error", code, message}`
 
-Close codes: `4001` replaced by another session, `4003` bad key or origin, `4004` game disabled or deleted, `4005` kicked or banned by admin, `4008` hello timeout, `4029` rate limited. Don't auto-reconnect on 4001, 4003, 4004 or 4005. On other closes, reconnect with backoff, send hello with the saved token, then `join` the same room id within 15 s to keep the slot.
+**Session format (v2, optional).** The JS SDK wraps every message in a frame so traffic can move between links:
+- reliable `{"q":<seq>,"a":<ack>,"m":<message>}`, unreliable `{"a":<ack>,"m":<message>}`, ack only `{"a":<ack>}`. `q` counts up from 1 in each direction. `a` is the highest seq received without gaps; resend unacked frames after ~2×RTT on UDP. Deliver reliable messages in `q` order and drop duplicates.
+- The server switches a WebSocket to v2 when its first frame starts with `{"q":`. Its `welcome` then includes `transports: { webrtc: bool, udp: { port, sid, host? } }`.
+- UDP: send datagrams `<sid>|<frame>` to `udp.port`, starting with `<sid>|{"h":1}` until the server answers `{"hk":1}`. Keep each datagram under ~1150 bytes; send larger messages over the WebSocket (the seq keeps them in order).
+- Probes on any link: `{"pi":n}` is answered on the same link with `{"po":n}`. Pick a link and tell the server over the WebSocket: `{"use":"udp"|"webrtc"|"websocket","rtt":ms}`.
+- WebRTC: over the WebSocket send `{"sig":{"type":"offer","sdp"}}` and `{"sig":{"cand","mid"}}`. The server answers `{"sig":{"type":"answer","sdp"}}`. Open data channels `r` (ordered) and `u` (`ordered:false, maxRetransmits:0`).
+- `player.set` may carry `s` (an increasing number). The server ignores an `s` that isn't newer than the last one, and the `player` push carries it too.
+
+Close codes: `4001` replaced by another session, `4003` bad key or origin, `4004` game disabled or deleted, `4005` kicked or banned by admin, `4008` hello timeout, `4029` rate limited or too far behind on acks. Don't auto-reconnect on 4001, 4003, 4004 or 4005. On other closes, reconnect with backoff, send hello with the saved token, then `join` the same room id within 15 s to keep the slot.
 
 ## 9. Limits
 
