@@ -2,6 +2,8 @@
 
 A self-hosted, game-agnostic multiplayer backend. One Docker stack on your VPS gives you:
 
+- **Public servers and open worlds**: a server browser of permanent, admin-defined servers (name, region, tags, MOTD, password, whitelist, join queue, saved state), rooms of up to 5000 players, and interest management so each player only receives the players near them (1000 players in one room measured with a 0 ms median ping).
+- **Customisable per game**: limits (room size, room count, rate limits, reconnect grace), named room types that clients can't override, room defaults, and anything else via server scripts. All of it is edited in the dashboard.
 - **Realtime rooms**: share codes, matchmaking (`quickJoin`), host election and migration, kick/ban, locking, passwords, reconnects that keep the player's slot.
 - **Three sync channels**: ordered shared room state, per-player data, and relay messages (to everyone, the host, or specific players, plus DMs).
 - **Server scripts**: optional authoritative game logic per game, edited in the dashboard. Each hook call has a CPU limit, and a script that crashes or loops forever is stopped without taking the server down. An action costs 1 round trip instead of 2 through a host client.
@@ -102,7 +104,7 @@ Push the repo, then go to **Settings → Pages → Deploy from branch → `main`
 
 ```bash
 cd server && npm install && npm start     # http://localhost:8080, admin token printed on first run
-npm test                                  # end-to-end smoke test (80 checks: rooms, storage, leaderboards, social, inbox, matchmaking, chat, UDP/WebRTC, packet loss, failover)
+npm test                                  # end-to-end smoke test (97 checks: rooms, public servers, open-world interest management, room types, storage, leaderboards, social, inbox, matchmaking, chat, UDP/WebRTC, packet loss, failover)
 ```
 
 ## Configuration (`.env`)
@@ -115,7 +117,6 @@ npm test                                  # end-to-end smoke test (80 checks: ro
 | `RATE_LIMIT` / `RATE_BURST` | `60` / `200` | Messages per second per connection |
 | `MAX_MSG_BYTES` | `65536` | Maximum size per message and per stored value |
 | `RECONNECT_GRACE_MS` | `15000` | How long a dropped player keeps their room slot |
-| `MAX_ROOM_PLAYERS` | `256` | |
 | `MAX_CONNS_PER_IP` | `50` | |
 | `PUBLIC_IP` | – | Public IPv4 advertised in WebRTC candidates. Required in Docker for browsers to reach WebRTC. |
 | `UDP_PORT` | `8081` | Raw UDP transport, `0` = off |
@@ -124,9 +125,11 @@ npm test                                  # end-to-end smoke test (80 checks: ro
 | `UDP_HOST` | host the client connected to | Host clients send raw UDP to |
 | `ICE_SERVERS` | – | Comma-separated STUN/TURN URLs for the server's WebRTC peer |
 | `STORAGE_MAX_KEYS` | `1000` | Keys per player per scope (the game scope gets 10×) |
+| `MAX_ROOM_PLAYERS` / `HARD_MAX_ROOM_PLAYERS` | `1000` / `5000` | Default room-size cap / the most any game may raise it to |
+| `MAX_ROOMS_PER_GAME` | `10000` | Open rooms per game (games can lower it) |
 
 ## Admin REST API
 
 All routes take `Authorization: Bearer ADMIN_TOKEN`.
 
-`GET /api/admin/overview` (includes online players) · `POST /api/admin/games/:id/players/:pid/kick` (`{ban, reason}`) · `POST /api/admin/games/:id/players/:pid/unban` · `GET /api/admin/games/:id/leaderboards` · `GET|DELETE /api/admin/games/:id/leaderboards/:board` (`?period=day&previous=1`; DELETE resets every period, `?config=delete` also drops the config) · `GET|PUT /api/admin/games/:id/leaderboards/:board/config` (`{mode, sort, periods, clientWrite, min, max}`) · `POST /api/admin/games/:id/leaderboards/:board/submit` (`{player, score, meta}`) · `DELETE /api/admin/games/:id/leaderboards/:board/players/:pid` · `POST /api/admin/games/:id/inbox` (`{to: id | [ids], type, data}`) · `GET|POST /api/admin/games` · `GET|PATCH|DELETE /api/admin/games/:id` (PATCH accepts `{name, enabled, rotateKey, settings:{allowedOrigins, gameDataWrite, playerDataWrite, lockLeaderboards, inboxClientSend, config}}`; changing `config` pushes it to every connected client) · `POST /api/admin/games/:id/rooms/:room/close|kick|state` · `POST /api/admin/games/:id/broadcast` · `GET|PUT|DELETE /api/admin/games/:id/kv` · `GET|DELETE /api/admin/games/:id/leaderboards/:board`
+`GET /api/admin/overview` (includes online players) · `POST /api/admin/games/:id/players/:pid/kick` (`{ban, reason}`) · `POST /api/admin/games/:id/players/:pid/unban` · `GET /api/admin/games/:id/leaderboards` · `GET|DELETE /api/admin/games/:id/leaderboards/:board` (`?period=day&previous=1`; DELETE resets every period, `?config=delete` also drops the config) · `GET|PUT /api/admin/games/:id/leaderboards/:board/config` (`{mode, sort, periods, clientWrite, min, max}`) · `POST /api/admin/games/:id/leaderboards/:board/submit` (`{player, score, meta}`) · `DELETE /api/admin/games/:id/leaderboards/:board/players/:pid` · `GET|POST /api/admin/games/:id/servers` · `GET|PATCH|DELETE /api/admin/games/:id/servers/:sid` (`{name, description, region, tags, maxPlayers, password, visibility, whitelist, queue, motd, type, options, enabled}`) · `POST /api/admin/games/:id/inbox` (`{to: id | [ids], type, data}`) · `GET|POST /api/admin/games` · `GET|PATCH|DELETE /api/admin/games/:id` (PATCH accepts `{name, enabled, rotateKey, settings:{allowedOrigins, gameDataWrite, playerDataWrite, lockLeaderboards, inboxClientSend, config, limits, roomTypes, roomDefaults, requireRoomType}}`; changing `config` pushes it to every connected client) · `POST /api/admin/games/:id/rooms/:room/close|kick|state` · `POST /api/admin/games/:id/broadcast` · `GET|PUT|DELETE /api/admin/games/:id/kv` · `GET|DELETE /api/admin/games/:id/leaderboards/:board`

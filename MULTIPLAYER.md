@@ -69,6 +69,7 @@ Pick based on the game type and say which one you chose:
 | Turn-based, board, card, party, quiz, puzzle | **Shared state.** Put the whole game in `room.state` and write with `setState`/`batchState`. Optionally set `stateWrite: 'host'` and have clients *request* moves from the host. |
 | Real-time action with rules that matter (scoring, damage, pickups, win conditions, competitive) | **Server script (preferred).** Put the rules in a server script (§5b). Clients send intents with `mp.send(type, data, 'server')`. The script validates them and writes `room.state`. That's **1 round trip**. Movement stays client-side in `setPlayer` and is rendered with `mp.predict()`. |
 | Same, but you can't install a server script | **Host-authoritative.** Clients send intents with `mp.send(type, data, 'host')`, and the host validates them and writes `room.state` (`stateWrite: 'host'`). This costs **2 round trips** (client → server → host → server → everyone), so mask it with local prediction (§6a). |
+| Open world, survival, MMO-lite (dozens to 1000+ players in one place) | **Public servers + `aoi`.** The admin creates servers in the dashboard; players pick one with `mp.servers.list()` / `mp.joinServer()`. Movement goes through `setPlayer(..., {unreliable: true})`, and `aoi` limits each player to their surroundings. World rules live in the server script with `room.storage` for persistence. |
 | Casual real-time (cursors, movement, co-op sandbox) | **Client-authoritative.** Each client owns its avatar via `setPlayer({x,y,...})` at 10–20 Hz. Interpolate remote players. Use `send` for events. |
 
 Authoritative logic runs either in a **server script** (§5b, fastest and cheat-resistant) or on the **host client**. With the host pattern: Host migration is automatic, so any client must be able to take over as host from `room.state` alone. **Keep all authoritative data in `room.state`, not in host-local variables.**
@@ -124,10 +125,76 @@ The SDK connects over **WebSocket** first, so `connect()` is never slower than b
 | `await mp.listRooms(tag?)` | Public rooms: `[{id, players, maxPlayers, meta, locked, tag, hasPassword, ...}]`. |
 | `await mp.updateRoom({locked, private, maxPlayers, meta, stateWrite})` | **Host only.** For example, `locked: true` when the match starts. |
 | `await mp.kick(playerId, ban=false)` / `await mp.transferHost(playerId)` | Host only. |
-| `mp.room` | `{id, host, meta, maxPlayers, locked, private, tag, stateWrite, hasPassword, created}` or `null`. |
-| `mp.players` (Map id→player), `mp.playerList` (array), `mp.me`, `mp.isHost` | player = `{id, name, data, connected, joined, username}`. |
+| `mp.room` | `{id, host, meta, maxPlayers, playerCount, locked, private, tag, type, stateWrite, hasPassword, created, aoi?, server?}` or `null`. |
+| `mp.players` (Map id→player), `mp.playerList` (array), `mp.me`, `mp.isHost` | player = `{id, name, data, connected, joined, username}`. In an `aoi` room this only holds players in range. |
+| `mp.playerCount` | Everyone in the room, including players out of range. |
 
-**Room options** (used when the room is created): `maxPlayers` (default 16), `private` (hidden from list and quickJoin), `password`, `tag`, `meta` (public object such as map or mode), `persist` (room state is saved when the room empties and restored when a room with the same id is created again, which suits persistent worlds), `stateWrite: 'all' | 'host'`, `state` (initial state), `playerData` (initial data for the joining player).
+**Room options** (used when the room is created):
+- `type`: a room type the game defines in the dashboard (see "Customising the server per game" below).
+- `maxPlayers`: default 16, up to the game's limit (1000 unless raised, at most 5000).
+- `private`: hidden from the room list and quickJoin.
+- `password`, `tag`, and `meta` (a public object such as map or mode).
+- `persist`: room state is saved when the room empties and restored when a room with the same id is created again.
+- `stateWrite: 'all' | 'host'`, and `state` (initial state).
+- `aoi: { radius, keys }`: interest management for big worlds (see "Open worlds" below).
+- `queue: false`: refuse the join queue for this room.
+
+**Join options:** `playerData` (initial data for the joining player), `password`, `mustExist`, and `queue: true` (wait in line if the room is full).
+
+### Public servers (server browser)
+Permanent rooms the admin sets up in the dashboard (**Game → Servers**) or through the admin API. They're always open and keep their state across restarts. Players pick one from a list, and full servers have a join queue. Use them for open-world, survival, MMO-lite and community games.
+```js
+const list = await mp.servers.list({ region: 'eu', tag: 'pvp' });
+// → [{id, name, description, region, tags, motd, players, maxPlayers, full, queue, hasPassword, whitelisted, type, aoi, meta}], busiest first
+await mp.servers.get('eu-1');                       // one server, also works for unlisted ones
+mp.on('queue', ({ room, position }) => showQueue(position));  // fires while you wait for a full server
+const room = await mp.joinServer('eu-1', { password, playerData: { x: 0, y: 0 } }); // resolves once you're in
+await mp.joinServer('eu-1', { queue: false });     // fail with 'room_full' instead of waiting
+await mp.leaveQueue();                              // the pending joinServer rejects with 'cancelled'
+```
+Server config (admin): `id, name, description, region, tags, maxPlayers, password, visibility: 'public' | 'unlisted', whitelist` (player ids or usernames), plus:
+- `queue` (default true) and `motd`
+- `type`: a room type, see below
+- `options`: any room option, e.g. `{ aoi: { radius: 150 }, stateWrite: 'host' }`
+- `enabled`
+
+Changing `maxPlayers`, the password or the whitelist applies live, and raising `maxPlayers` lets queued players in. A server runs your server script like any other room, so `onCreate`, `onTick` and the rest work for persistent worlds. State is saved every 30 s and on shutdown.
+
+### Open worlds: interest management (`aoi`)
+In a normal room every update goes to everyone, so cost grows with players². With `aoi`, each player only receives the players within `radius` of them:
+```js
+await mp.join('world', { maxPlayers: 1000, aoi: { radius: 150, keys: ['x', 'y'] }, playerData: { x: 10, y: 20 } }); // keys: ['x','y','z'] for 3D
+mp.setPlayer({ x, y }, { unreliable: true });       // your position: the fields named in keys
+mp.on('playerJoined', (p, info) => spawnAvatar(p)); // info.inRange: they came into view
+mp.on('playerLeft', (p, reason) => removeAvatar(p)); // reason 'out_of_range' when they move away
+mp.send('emote', 'wave', 'nearby');                 // only players who can see you
+```
+- `mp.players` holds you plus players in range, so code written for small rooms works unchanged: avatars appear and disappear as people move. `mp.playerCount` is the true total.
+- Players without the position fields aren't visible to anyone until they set them.
+- Room state, `send` to `'all'` / `'host'` / ids, and host events still go to everyone. Keep huge or fast-changing world data out of `room.state`; put it in player data, storage or server-script logic.
+- Measured on one machine: 1000 players in one room, all moving at 10 Hz, with a median ping of 0 ms. Without `aoi`, 300 players already overload the server.
+- Server scripts get `room.nearby(playerId)` for the players that can see someone, e.g. for proximity damage or loot.
+
+### Customising the server per game
+Everything below is set per game in the dashboard (**Settings → Room rules**) or with `PATCH /api/admin/games/:id` `{settings: {...}}`. No code changes needed.
+```json
+{
+  "limits": { "maxRoomPlayers": 2000, "maxRooms": 5000, "defaultMaxPlayers": 8,
+              "rateLimit": 120, "rateBurst": 300, "reconnectGraceMs": 30000 },
+  "roomTypes": {
+    "duel":  { "maxPlayers": 2, "stateWrite": "host", "meta": { "mode": "duel" } },
+    "squad": { "maxPlayers": 4, "private": true },
+    "world": { "maxPlayers": 1000, "aoi": { "radius": 150 }, "persist": true, "clientOptions": false }
+  },
+  "roomDefaults": { "maxPlayers": 8 },
+  "requireRoomType": true
+}
+```
+- **`limits`** override the server-wide ones for this game: room size (up to 5000), number of open rooms, the default room size, the message rate per player and how long a dropped player keeps their slot.
+- **`roomTypes`** are named templates. Clients create rooms with `create({ type: 'duel' })` or `quickJoin('ranked', { type: 'duel' })`. The template's fields always win over the client's, so clients can't make a 2-player duel into a 50-player one. `clientOptions: false` ignores every client option except `password` and `playerData`. Matchmaking (`options: { type }`) and public servers (`type`) use them too.
+- **`roomDefaults`** apply to rooms created without a type.
+- **`requireRoomType: true`** rejects rooms without a known type (`room_type_required`), so clients can only create the kinds of rooms you've defined.
+- Other per-game switches: `gameDataWrite`, `playerDataWrite`, `lockLeaderboards`, `inboxClientSend`, `allowedOrigins`, `config` (remote config). Server-side logic is in the server script (§5b).
 
 ### Shared room state
 | Call | Notes |
@@ -303,11 +370,12 @@ Logging in leaves the current room. Rejoin afterwards. A login kicks any other a
 | `inbox` | `item`: new inbox message |
 | `chat` / `chat:<channel>` | `{channel, from, name, text, data, ts}` |
 | `matched` / `matchmakingCancelled` | `(room, queue)` / `(queue, reason)` |
+| `queue` / `queueCancelled` | `{room, position}` while waiting for a full room / `{room, reason}` |
 | `config` | `config`: remote config changed |
 | `transport` | `(now, previous, stats)`. Traffic moved to another link. |
 | `transportFailed` | `(kind)`. A link couldn't be opened (retried with backoff). |
 
-Request errors reject with `MultiplayerError` (`err.code`): `not_connected`, `timeout`, `not_in_room`, `not_host`, `room_full`, `room_locked`, `room_not_found`, `bad_password`, `banned`, `bad_path`, `bad_key`, `bad_scope`, `forbidden`, `too_large`, `username_taken`, `bad_credentials`, `already_registered`, `player_offline`, `no_server_script`, `version_conflict`, `quota_exceeded`, `bad_query`, `board_not_found`, `bad_period`, `bad_score`, `blocked`, `player_not_found`, `no_request`, `not_in_channel`, `cancelled`.
+Request errors reject with `MultiplayerError` (`err.code`): `not_connected`, `timeout`, `not_in_room`, `not_host`, `room_full`, `room_locked`, `room_not_found`, `bad_password`, `banned`, `bad_path`, `bad_key`, `bad_scope`, `forbidden`, `too_large`, `username_taken`, `bad_credentials`, `already_registered`, `player_offline`, `no_server_script`, `version_conflict`, `quota_exceeded`, `bad_query`, `board_not_found`, `bad_period`, `bad_score`, `blocked`, `player_not_found`, `no_request`, `not_in_channel`, `cancelled`, `room_type_required`, `bad_room_type`, `bad_aoi`, `too_many_rooms`, `not_whitelisted`, `server_not_found`, `queue_full`.
 
 ## 5b. Server scripts (authoritative logic on the server)
 
@@ -328,7 +396,7 @@ module.exports = {
 
 | `room` API (inside the script) | |
 |---|---|
-| `room.id`, `room.meta`, `room.host`, `room.players` (array), `room.player(id)` | Read-only views. |
+| `room.id`, `room.meta`, `room.host`, `room.players` (array), `room.player(id)`, `room.nearby(id)` | Read-only views. `nearby` = players who can see `id` (in range in an `aoi` room; everyone else otherwise). |
 | `room.state` / `room.getState('a.b')` | Read. |
 | `room.setState(path, value)`, `room.deleteState(path)`, `room.batchState([[path, value], [path, null, 1]])` | All writes in one hook call are sent to clients as **one** batched update. |
 | `room.send(type, data, to?)` | `to`: omitted for everyone, a playerId, or an array. Clients receive it with `from === 'server'`. |
@@ -455,11 +523,13 @@ WebSocket `wss://HOST/ws`. Messages are text frames of JSON objects with a type 
 | `ping` | – | `{s: serverTimeMs}` |
 | `name` | `name` | `{name}` |
 | `rooms` | `tag?` | room list |
-| `join` | `room`, `options?` | room snapshot `{id, host, meta, maxPlayers, locked, private, tag, stateWrite, hasPassword, created, players:[...], state}` |
+| `join` | `room`, `options?` (room options + `password`, `playerData`, `mustExist`, `queue`) | room snapshot `{id, host, meta, maxPlayers, playerCount, locked, private, tag, type, stateWrite, hasPassword, created, aoi?, server?, players:[...], state}`, or `{queued: true, room, position}` |
 | `create` | `options?` | snapshot |
 | `quick` | `tag`, `options?` | snapshot |
 | `leave` | – | `true` |
 | `room.update` | `locked? private? maxPlayers? meta? stateWrite? host?` | room info |
+| `servers.list` / `servers.get` | `tag?, region?` / `id` | servers / server |
+| `queue.leave` | – | `true` |
 | `kick` | `id, ban?` | `true` |
 | `state.set` | `ops: [[path, value], [path, null, 1]]` | `true` |
 | `player.set` | `data, replace?` | `true` |
@@ -488,6 +558,9 @@ Server pushes:
 - `{t:"friend", id, name, state, online?, status?, data?}`, `{t:"presence", id, online, status, data}`
 - `{t:"inbox", item}`, `{t:"chat", channel, from, name, text, data, ts}`, `{t:"config", config}`
 - `{t:"matched", queue, room: <snapshot>}`: you're now in that room. `{t:"mm.cancelled", queue, reason}`
+- `{t:"queue", room, position}`, `{t:"queue.joined", room: <snapshot>}`: you're now in that room. `{t:"queue.cancelled", room, reason}`
+- In `aoi` rooms, `player.joined` carries `aoi: true` when someone comes into range, and `player.left` has reason `out_of_range` when they leave it. `{t:"room", room: {playerCount}}` is pushed when the count changes (at most every 2 s).
+- `send` also accepts `to: "nearby"`.
 
 `welcome` also carries `config` and `inbox: {unread}`.
 
@@ -505,6 +578,7 @@ Close codes: `4001` replaced by another session, `4003` bad key or origin, `4004
 
 - 64 KB per message and per stored value. Up to 256 state ops per batch.
 - About 60 messages/s sustained per connection (burst 200). Excess messages are dropped with an `error` `rate_limited` event.
-- One room per connection. Rooms are in memory and disappear when empty unless `persist: true`.
+- One room per connection. Rooms are in memory and disappear when empty unless they're public servers (or `persist: true`, which saves the state for next time).
+- Up to 1000 players per room by default. A game can raise this to 5000 with `limits.maxRoomPlayers`; use `aoi` above a few dozen players.
 - Without a server script the server trusts clients. For competitive integrity, use a server script with `authoritative: true` and validate in `onMessage`. Leaderboard submissions are client-reported.
 - Server scripts get 50 ms of CPU per hook call and up to 60 Hz ticks.

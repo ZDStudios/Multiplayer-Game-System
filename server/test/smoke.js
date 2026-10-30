@@ -311,6 +311,97 @@ try {
   await api('DELETE', `/games/${game.id}/script`);
   for (const x of [x1, x2, x3, m1, m2, m3, sc]) x.disconnect();
 
+  {
+  // ---- public servers ----
+  const pw = async (name) => { const x = new Multiplayer({ url: BASE, key: game.key, name, transports: ['websocket'] }); await x.connect(); return x; };
+  const made = await api('POST', `/games/${game.id}/servers`, { id: 'eu-1', name: 'EU #1', region: 'eu', tags: ['pvp'], maxPlayers: 2, motd: 'Welcome' });
+  assert.equal(made.status, 201);
+  const v1 = await pw('S1'), v2 = await pw('S2'), v3 = await pw('S3');
+  const list = await v1.servers.list({ region: 'eu' });
+  assert.deepEqual(list.map((x) => [x.id, x.name, x.players, x.maxPlayers]), [['eu-1', 'EU #1', 0, 2]]); ok('servers: admin-defined server shows in the server list');
+  await v1.joinServer('eu-1');
+  await v1.setState('world.day', 3);
+  await v1.leave();
+  assert.equal((await v2.servers.get('eu-1')).players, 0);
+  await v1.joinServer('eu-1');
+  assert.equal(v1.state.world.day, 3); assert.equal(v1.room.server, 'EU #1'); ok('servers: stay open when empty and keep their state');
+  await v2.joinServer('eu-1');
+  await assert.rejects(v3.joinServer('eu-1', { queue: false }), { code: 'room_full' });
+  const pos = new Promise((r) => v3.once('queue', r));
+  const queued = v3.joinServer('eu-1');
+  assert.equal((await pos).position, 1);
+  assert.equal((await v1.servers.get('eu-1')).queue, 1);
+  await v1.leave();
+  assert.equal((await queued).id, 'eu-1'); assert.equal(v3.room.id, 'eu-1'); ok('servers: full server -> queue position -> auto-join when a slot frees');
+  const q2 = v1.joinServer('eu-1');
+  await waitFor(async () => (await v2.servers.get('eu-1')).queue === 1);
+  await api('PATCH', `/games/${game.id}/servers/eu-1`, { maxPlayers: 3 });
+  assert.equal((await q2).id, 'eu-1'); ok('servers: raising maxPlayers lets the queue in');
+  const q3 = (await pw('S4')).joinServer('eu-1');
+  const cancelled3 = assert.rejects(q3, { code: 'server_deleted' });
+  await api('PATCH', `/games/${game.id}/servers/eu-1`, { visibility: 'unlisted', password: 'pw' });
+  assert.equal((await v1.servers.list()).length, 0);
+  await assert.rejects((await pw('S5')).joinServer('eu-1', { queue: false }), { code: 'bad_password' }); ok('servers: unlisted + password');
+  const kicked = new Promise((r) => v1.once('left', (room, reason) => r(reason)));
+  await api('DELETE', `/games/${game.id}/servers/eu-1`);
+  assert.equal(await kicked, 'server_deleted'); await cancelled3; ok('servers: delete closes the server and its queue');
+  for (const x of [v1, v2, v3]) x.disconnect();
+
+  // ---- room types + per-game limits ----
+  await api('PATCH', `/games/${game.id}`, { settings: { requireRoomType: true,
+    roomTypes: { duel: { maxPlayers: 2, stateWrite: 'host', meta: { mode: 'duel' } }, world: { maxPlayers: 500, aoi: { radius: 100 } } } } });
+  const rt = await pw('RT');
+  await assert.rejects(rt.create({ maxPlayers: 50 }), { code: 'room_type_required' });
+  await assert.rejects(rt.create({ type: 'nope' }), { code: 'bad_room_type' });
+  const duel = await rt.create({ type: 'duel', maxPlayers: 99, meta: { map: 'pit' } });
+  assert.deepEqual([duel.type, duel.maxPlayers, duel.stateWrite, duel.meta.mode, duel.meta.map], ['duel', 2, 'host', 'duel', 'pit']); ok('room types: templates win over client options; requireRoomType enforced');
+  await api('PATCH', `/games/${game.id}`, { settings: { limits: { maxRoomPlayers: 3 } } });
+  assert.equal((await rt.create({ type: 'world' })).maxPlayers, 3); ok('limits: per-game maxRoomPlayers caps every room');
+  await api('PATCH', `/games/${game.id}`, { settings: { limits: { maxRoomPlayers: 2000 } } });
+  assert.equal((await rt.create({ type: 'world' })).maxPlayers, 500);
+  await api('PATCH', `/games/${game.id}`, { settings: { requireRoomType: null, roomTypes: null, limits: null } });
+  rt.disconnect();
+
+  // ---- open world: interest management ----
+  const at = async (name, x, y) => { const p = await pw(name); await p.join('OPEN', { maxPlayers: 2000, aoi: { radius: 100 }, playerData: { x, y } }); return p; };
+  const wa = await at('WA', 0, 0), wb = await at('WB', 50, 0), wc = await at('WC', 1000, 0);
+  assert.deepEqual([...wb.players.keys()].sort(), [wa.playerId, wb.playerId].sort());
+  assert.ok(!wa.players.has(wc.playerId)); assert.ok(wa.players.has(wb.playerId)); ok('aoi: snapshot only holds players in range');
+  await waitFor(() => wa.playerCount === 3, 3000); ok('aoi: playerCount still counts everyone');
+  const seen = [];
+  wc.on('playerUpdated', (p) => seen.push(p.id));
+  wa.setPlayer({ hp: 5 });
+  await waitFor(() => wb.players.get(wa.playerId).data.hp === 5);
+  await sleep(100);
+  assert.ok(!seen.includes(wa.playerId)); ok('aoi: updates only reach players in range');
+  const enter = new Promise((r) => wa.on('playerJoined', (p, info) => p.id === wc.playerId && r(info)));
+  wc.setPlayer({ x: 60, y: 10 });
+  assert.deepEqual(await enter, { inRange: true });
+  await waitFor(() => wc.players.has(wa.playerId) && wc.players.has(wb.playerId)); ok('aoi: moving closer brings players into view (both ways)');
+  const exit = new Promise((r) => wa.on('playerLeft', (p, reason) => p.id === wc.playerId && r(reason)));
+  wc.setPlayer({ x: 5000, y: 0 });
+  assert.equal(await exit, 'out_of_range');
+  await waitFor(() => !wc.players.has(wa.playerId)); ok('aoi: moving away removes them (reason out_of_range)');
+  const near = new Promise((r) => wb.onMessage('shout', r));
+  let far = false; wc.onMessage('shout', () => { far = true; });
+  wa.send('shout', 'hi', 'nearby');
+  assert.equal(await near, 'hi'); await sleep(100); assert.equal(far, false); ok("aoi: send(..., 'nearby') reaches only players in range");
+  const gone = new Promise((r) => wa.on('playerLeft', (p, reason) => p.id === wb.playerId && r(reason)));
+  await wb.leave();
+  assert.equal(await gone, 'left'); ok('aoi: leaving notifies only those who could see you');
+  for (const x of [wa, wb, wc]) x.disconnect();
+
+  // ---- leaderboard compatibility with older clients ----
+  const oldc = await pw('Old');
+  await oldc.leaderboard.submit('ow_set', 10, { mode: 'set' });
+  await oldc.leaderboard.submit('ow_set', 3, { mode: 'set' });
+  assert.equal((await oldc.leaderboard.top('ow_set')).entries[0].score, 3); ok("compat: mode 'set' still overwrites");
+  await api('POST', `/games/${game.id}/leaderboards/ow_legacy/submit`, { player: 'p_old1', score: 50 });
+  await api('POST', `/games/${game.id}/leaderboards/ow_legacy/submit`, { player: 'p_old2', score: 20 });
+  assert.deepEqual((await oldc.leaderboard.top('ow_legacy', { order: 'asc' })).entries.map((e) => e.score), [20, 50]); ok("compat: top({order:'asc'}) still overrides the sort");
+  oldc.disconnect();
+
+  }
   // ---- transports ----
   const tw = new Multiplayer({ url: BASE, key: game.key, transports: ['websocket'] });
   await tw.connect({ room: 'NET' });

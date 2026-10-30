@@ -275,6 +275,8 @@ module.exports = {
     // e.g. timers, regen, AI, physics. room.data is server-only scratch space.
   },
 };`;
+const SERVER_TEMPLATE = { id: 'eu-1', name: 'EU #1', description: '', region: 'eu', tags: ['pvp'], maxPlayers: 200,
+  visibility: 'public', password: null, queue: true, motd: 'Welcome!', options: { aoi: { radius: 150, keys: ['x', 'y'] }, persist: true } };
 async function renderDetail() {
   const g = await api('GET', '/games/' + encodeURIComponent(current));
   const keep = document.activeElement && document.activeElement.closest('#detail .nore');
@@ -282,11 +284,12 @@ async function renderDetail() {
   document.querySelectorAll('#detail details[open]').forEach((d) => openRooms.add(d.dataset.room));
   document.querySelectorAll('#detail details:not([open])').forEach((d) => openRooms.delete(d.dataset.room));
   const origins = (g.settings.allowedOrigins || []).join(', ');
-  const tabs = ['rooms', 'players', 'server logic', 'leaderboards', 'storage', 'settings'];
+  const tabs = ['rooms', 'servers', 'players', 'server logic', 'leaderboards', 'storage', 'settings'];
+  const rules = { limits: g.settings.limits || {}, roomTypes: g.settings.roomTypes || {}, roomDefaults: g.settings.roomDefaults || {}, requireRoomType: !!g.settings.requireRoomType };
   let body = '';
   if (detailTab === 'rooms') body = g.rooms.length ? g.rooms.map((r) => `<details class="room" data-room="${esc(r.id)}" ${openRooms.has(r.id) ? 'open' : ''}>
       <summary><b class="mono">${esc(r.id)}</b><span class="tag acc">${r.players.length}/${r.maxPlayers}</span>
-        ${r.tag ? `<span class="tag">${esc(r.tag)}</span>` : ''}${r.private ? '<span class="tag">private</span>' : ''}${r.locked ? '<span class="tag">locked</span>' : ''}${r.persist ? '<span class="tag">persist</span>' : ''}${r.stateWrite === 'host' ? '<span class="tag">host-auth</span>' : ''}
+        ${r.tag ? `<span class="tag">${esc(r.tag)}</span>` : ''}${r.private ? '<span class="tag">private</span>' : ''}${r.locked ? '<span class="tag">locked</span>' : ''}${r.persist ? '<span class="tag">persist</span>' : ''}${r.server ? `<span class="tag acc">server: ${esc(r.server)}</span>` : ''}${r.type ? `<span class="tag">${esc(r.type)}</span>` : ''}${r.aoi ? `<span class="tag">aoi r=${r.aoi.radius}</span>` : ''}${r.queue ? `<span class="tag">${r.queue} queued</span>` : ''}${r.stateWrite === 'host' ? '<span class="tag">host-auth</span>' : ''}
         <span class="sp"></span><span class="mute">${ago(r.created).replace(' ago', '')} old</span>
         <button class="sm danger" data-close="${esc(r.id)}">Close</button></summary>
       <div class="inner">
@@ -304,6 +307,14 @@ async function renderDetail() {
   if (detailTab === 'leaderboards') body = g.leaderboards.length ? g.leaderboards.map((b) => `<div class="row" style="padding:8px 0;border-bottom:1px solid var(--line)">
       <b class="mono">${esc(b.board)}</b><span class="tag">${num(b.entries)} entries</span>${b.config ? `<span class="tag">${esc(b.config.mode)} · ${esc(b.config.sort)}</span><span class="tag">${esc(b.config.periods.join(' / '))}</span>${b.config.clientWrite ? '' : '<span class="tag">server-only</span>'}` : ''}<span class="mute">${ago(b.updated)}</span><span class="sp"></span>
       <button class="sm" data-lbview="${esc(b.board)}">View</button><button class="sm danger" data-lbdel="${esc(b.board)}">Reset</button></div>`).join('') + '<pre id="lbOut" class="hidden"></pre>' : '<div class="empty">No leaderboards yet</div>';
+  if (detailTab === 'servers') body = `<div class="nore">
+      ${g.servers.length ? g.servers.map((x) => `<div class="row" style="padding:8px 0;border-bottom:1px solid var(--line)">
+        <b>${esc(x.name)}</b><span class="mono mute">${esc(x.id)}</span><span class="tag acc">${x.players}/${x.maxPlayers}</span>${x.queue ? `<span class="tag">${x.queue} queued</span>` : ''}
+        ${x.region ? `<span class="tag">${esc(x.region)}</span>` : ''}${x.tags.map((t) => `<span class="tag">${esc(t)}</span>`).join('')}${x.visibility === 'unlisted' ? '<span class="tag">unlisted</span>' : ''}${x.hasPassword ? '<span class="tag">password</span>' : ''}${x.aoi ? `<span class="tag">aoi r=${x.aoi.radius}</span>` : ''}
+        <span class="sp"></span><button class="sm" data-sedit="${esc(x.id)}">Edit</button><button class="sm danger" data-sdel="${esc(x.id)}">Delete</button></div>`).join('') : '<div class="empty">No public servers yet. They are permanent rooms players pick from a server list (mp.servers.list / mp.joinServer).</div>'}
+      <div class="mute" style="margin:14px 0 6px" id="srvTitle">New server (JSON)</div>
+      <textarea id="srvCfg" spellcheck="false" style="height:200px;font:12.5px/1.45 var(--mono)">${esc(JSON.stringify(SERVER_TEMPLATE, null, 2))}</textarea>
+      <div class="row" style="margin-top:6px"><span class="mute">Fields: id, name, description, region, tags, maxPlayers, password, visibility (public | unlisted), whitelist, queue, motd, type, options (any room option, e.g. aoi), enabled.</span><span class="sp"></span><button class="sm" id="srvNew">Clear</button><button class="sm primary" id="srvSave">Create server</button></div></div>`;
   if (detailTab === 'storage') body = `<div class="row nore"><select id="kvScope" style="width:auto"><option value="">all scopes</option><option>game</option><option>player</option><option>private</option><option>room</option></select>
       <input id="kvPrefix" placeholder="key prefix" style="width:200px"><button class="sm" id="kvLoad">Search</button></div>
       <div class="tablewrap"><table style="margin-top:10px"><thead><tr><th>Scope</th><th>Owner</th><th>Key</th><th>Size</th><th>Updated</th><th></th></tr></thead><tbody id="kvRows"><tr><td colspan="6" class="empty">${num(g.kvEntries)} entries — search to browse</td></tr></tbody></table></div><pre id="kvOut" class="hidden"></pre>
@@ -319,6 +330,7 @@ async function renderDetail() {
       <span class="mute">Player data writes</span><div class="row"><select id="sPW" style="width:auto"><option value="all" ${g.settings.playerDataWrite !== 'none' ? 'selected' : ''}>Clients may write their own player/private data</option><option value="none" ${g.settings.playerDataWrite === 'none' ? 'selected' : ''}>Server script only (anti-cheat for currency, XP…)</option></select></div>
       <span class="mute">Leaderboards</span><div class="row"><select id="sLB" style="width:auto"><option value="open" ${g.settings.lockLeaderboards !== true ? 'selected' : ''}>Clients may create boards on first submit</option><option value="locked" ${g.settings.lockLeaderboards === true ? 'selected' : ''}>Only boards created via the admin API</option></select></div>
       <span class="mute">Remote config</span><div><textarea id="sCfg" spellcheck="false" style="height:120px;font:12.5px/1.45 var(--mono)" placeholder='{"motd": "Season 2!", "maxSpeed": 5}'>${esc(JSON.stringify(g.settings.config || {}, null, 2))}</textarea><div class="row" style="margin-top:6px"><span class="mute">Readable by every client as <code>mp.config</code>; pushed live on save.</span><span class="sp"></span><button class="sm" id="sCfgSave">Save config</button></div></div>
+      <span class="mute">Room rules</span><div><textarea id="sRules" spellcheck="false" style="height:200px;font:12.5px/1.45 var(--mono)">${esc(JSON.stringify(rules, null, 2))}</textarea><div class="row" style="margin-top:6px"><span class="mute"><b>limits</b>: maxRoomPlayers, maxRooms, defaultMaxPlayers, rateLimit, rateBurst, reconnectGraceMs · <b>roomTypes</b>: named templates (their fields win) · <b>roomDefaults</b>: applied to untyped rooms · <b>requireRoomType</b>: clients must pick a type.</span><span class="sp"></span><button class="sm" id="sRulesSave">Save rules</button></div></div>
       <span class="mute">Rename</span><div class="row"><input id="sName" value="${esc(g.name)}" style="flex:1"><button class="sm" id="sRename">Rename</button></div>
       <span class="mute">Broadcast</span><div class="row"><input id="bType" value="announcement" style="width:160px"><input id="bData" placeholder="message text or JSON" style="flex:1"><button class="sm" id="bSend">Send to all players</button></div>
       <span class="mute">Banned players</span><div class="row">${(g.settings.banned || []).map((id) => `<span class="tag mono">${esc(id)} <a href="#" data-unban="${esc(id)}" style="color:var(--bad)">unban</a></span>`).join(' ') || '<span class="mute">none</span>'}</div>
@@ -377,10 +389,38 @@ async function renderDetail() {
     $('#scRemove').onclick = async () => { if (!confirm('Remove the server script? Rooms fall back to client/host logic.')) return; show(await api('DELETE', `/games/${g.id}/script`)); $('#scCode').value = ''; toast('Removed'); };
     $('#scExample').onclick = () => { $('#scCode').value = SCRIPT_EXAMPLE; };
   }
+  if (detailTab === 'servers') {
+    let editing = null;
+    const reset = () => { editing = null; $('#srvTitle').textContent = 'New server (JSON)'; $('#srvSave').textContent = 'Create server'; $('#srvCfg').value = JSON.stringify(SERVER_TEMPLATE, null, 2); };
+    $('#srvNew').onclick = reset;
+    document.querySelectorAll('[data-sedit]').forEach((b) => b.onclick = async () => {
+      const x = await api('GET', `/games/${g.id}/servers/${encodeURIComponent(b.dataset.sedit)}`);
+      editing = x.id; $('#srvTitle').textContent = 'Edit server ' + x.id; $('#srvSave').textContent = 'Save changes';
+      $('#srvCfg').value = JSON.stringify(x.config || x, null, 2); $('#srvCfg').focus();
+    });
+    document.querySelectorAll('[data-sdel]').forEach((b) => b.onclick = async () => {
+      if (!confirm(`Delete server ${b.dataset.sdel}? Players in it are disconnected from the room.`)) return;
+      await api('DELETE', `/games/${g.id}/servers/${encodeURIComponent(b.dataset.sdel)}`); toast('Server deleted'); tick(true);
+    });
+    $('#srvSave').onclick = async () => {
+      let c; try { c = JSON.parse($('#srvCfg').value); } catch (e) { return toast('Not valid JSON'); }
+      try {
+        if (editing) await api('PATCH', `/games/${g.id}/servers/${encodeURIComponent(editing)}`, c);
+        else await api('POST', `/games/${g.id}/servers`, c);
+      } catch (e) { return toast(e.message); }
+      toast(editing ? 'Server updated' : 'Server created'); document.activeElement.blur(); reset(); tick(true);
+    };
+  }
   if (detailTab === 'settings') {
     document.querySelectorAll('[data-unban]').forEach((a) => a.onclick = async (e) => { e.preventDefault(); await api('POST', `/games/${g.id}/players/${encodeURIComponent(a.dataset.unban)}/unban`); toast('Unbanned'); tick(true); });
     $('#sSave').onclick = async () => { const list = $('#sOrigins').value.split(',').map((s) => s.trim()).filter(Boolean); await api('PATCH', '/games/' + g.id, { settings: { allowedOrigins: list, gameDataWrite: $('#sGW').value, playerDataWrite: $('#sPW').value, lockLeaderboards: $('#sLB').value === 'locked' } }); toast('Saved'); };
     $('#sGW').onchange = $('#sPW').onchange = $('#sLB').onchange = $('#sSave').onclick;
+    $('#sRulesSave').onclick = async () => {
+      let r; try { r = JSON.parse($('#sRules').value || '{}'); } catch (e) { return toast('Room rules are not valid JSON'); }
+      const keys = ['limits', 'roomTypes', 'roomDefaults', 'requireRoomType'], settings = {};
+      for (const k of keys) settings[k] = r[k] === undefined || r[k] === false ? null : r[k]; // null removes the setting
+      await api('PATCH', '/games/' + g.id, { settings }); toast('Room rules saved (new rooms use them)');
+    };
     $('#sCfgSave').onclick = async () => { let c; try { c = JSON.parse($('#sCfg').value || '{}'); } catch (e) { return toast('Config is not valid JSON'); } await api('PATCH', '/games/' + g.id, { settings: { config: c } }); toast('Config pushed to players'); };
     $('#sRename').onclick = async () => { await api('PATCH', '/games/' + g.id, { name: $('#sName').value }); toast('Renamed'); tick(true); };
     $('#bSend').onclick = async () => { let d; try { d = JSON.parse($('#bData').value); } catch { d = $('#bData').value; } const r = await api('POST', `/games/${g.id}/broadcast`, { type: $('#bType').value, data: d }); toast(`Delivered to ${r.delivered}`); };

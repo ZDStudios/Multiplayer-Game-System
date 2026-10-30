@@ -204,10 +204,10 @@
       };
       this.leaderboard = {
         submit: (board, score, o = {}) => this.request('lb.submit', { board, score, meta: o.meta, config: o.config, mode: o.mode }),
-        top: (board, o = {}) => this.request('lb.top', { board, limit: o.limit, offset: o.offset, period: o.period, previous: o.previous }),
-        around: (board, o = {}) => this.request('lb.around', { board, player: o.player, range: o.range, period: o.period, previous: o.previous }),
-        players: (board, players, o = {}) => this.request('lb.players', { board, players, period: o.period, previous: o.previous }),
-        friends: (board, o = {}) => this.request('lb.players', { board, friends: true, period: o.period, previous: o.previous }),
+        top: (board, o = {}) => this.request('lb.top', { board, limit: o.limit, offset: o.offset, period: o.period, previous: o.previous, order: o.order }),
+        around: (board, o = {}) => this.request('lb.around', { board, player: o.player, range: o.range, period: o.period, previous: o.previous, order: o.order }),
+        players: (board, players, o = {}) => this.request('lb.players', { board, players, period: o.period, previous: o.previous, order: o.order }),
+        friends: (board, o = {}) => this.request('lb.players', { board, friends: true, period: o.period, previous: o.previous, order: o.order }),
         boards: () => this.request('lb.boards'),
       };
       const who = (p) => (isObj(p) ? p : { player: p }); // playerId or { username }
@@ -227,6 +227,11 @@
         list: (o = {}) => this.request('inbox.list', o).then((r) => { this.inboxUnread = r.unread; return r; }),
         markRead: (ids = 'all') => this.request('inbox.read', { ids }).then((r) => { this.inboxUnread = r.unread; return r; }),
         delete: (ids) => this.request('inbox.delete', { ids }).then((r) => { this.inboxUnread = r.unread; return r; }),
+      };
+      // Public servers (permanent, listed rooms set up in the dashboard).
+      this.servers = {
+        list: (o = {}) => this.request('servers.list', { tag: o.tag, region: o.region }),   // [{id, name, players, maxPlayers, full, queue, region, tags, ...}]
+        get: (id) => this.request('servers.get', { id }),
       };
       this.chat = {
         join: (channel) => this.request('chat.join', { channel }),
@@ -301,6 +306,7 @@
           for (const p of this._pending.values()) { clearTimeout(p.timer); p.reject(new MultiplayerError('disconnected')); }
           this._pending.clear();
           if (this._mmWait) { this._mmWait.reject(new MultiplayerError('disconnected')); this._mmWait = null; } // tickets die with the connection
+          if (this._queueWait) { this._queueWait.reject(new MultiplayerError('disconnected')); this._queueWait = null; } // so do queue places
           clearInterval(this._pingTimer);
           this._closeLinks();
           const fatal = [4001, 4003, 4004, 4005].includes(ev.code);
@@ -337,7 +343,9 @@
         catch (e) { this._resetRoom('rejoin_failed'); }
         this._emit('reconnected', { room: this.room });
       } else if (joinP) {
-        this._applySnapshot(await joinP); // connect({room|quickJoin|create}) — rejects connect() if the join fails
+        const r = await joinP; // connect({room|quickJoin|create}) — rejects connect() if the join fails
+        if (r && r.queued) this._joined(r).catch(() => {}); // full server: connect() resolves now, 'queue' / 'joined' events follow
+        else this._applySnapshot(r);
       }
       this._emit('connected', { playerId: this.playerId, name: this.name, username: this.username, returning: m.returning });
       return { playerId: this.playerId, name: this.name, username: this.username, returning: m.returning };
@@ -586,8 +594,9 @@
           return this._emit('playerUpdated', pl, m.data || {});
         }
         case 'player.joined': {
+          if (!this.room) return;
           this.players.set(m.player.id, m.player);
-          return this._emit('playerJoined', m.player);
+          return this._emit('playerJoined', m.player, { inRange: !!m.aoi }); // inRange: came into view (interest management)
         }
         case 'player.left': {
           const pl = this.players.get(m.id);
@@ -633,6 +642,18 @@
           if (w) w.resolve(this.room);
           return this._emit('matched', this.room, m.queue);
         }
+        case 'queue': return this._emit('queue', { room: m.room, position: m.position });
+        case 'queue.joined': {
+          this._applySnapshot(m.room);
+          const w = this._queueWait; this._queueWait = null;
+          if (w) w.resolve(this.room);
+          return;
+        }
+        case 'queue.cancelled': {
+          const w = this._queueWait; this._queueWait = null;
+          if (w) w.reject(new MultiplayerError(m.reason || 'cancelled'));
+          return this._emit('queueCancelled', { room: m.room, reason: m.reason });
+        }
         case 'mm.cancelled': {
           const w = this._mmWait; this._mmWait = null;
           if (w) w.reject(new MultiplayerError(m.reason || 'cancelled'));
@@ -658,12 +679,30 @@
       this.room = null; this.state = {}; this.players = new Map();
       this._emit('left', old, reason);
     }
-    /** Join room by id (created if it doesn't exist). options: {maxPlayers, private, password, meta, tag, persist, stateWrite:'all'|'host', state, playerData, mustExist} */
-    async join(roomId, options = {}) { this._lastJoinOpts = { password: options.password }; return this._applySnapshot(await this.request('join', { room: roomId, options })); }
+    /** Join room by id (created if it doesn't exist). options: {type, maxPlayers, private, password, meta, tag, persist, stateWrite:'all'|'host', aoi:{radius, keys}, state, playerData, mustExist, queue} */
+    async join(roomId, options = {}) { this._lastJoinOpts = { password: options.password }; return this._joined(await this.request('join', { room: roomId, options })); }
+    /**
+     * Join a public server. When it's full you wait in line (event 'queue' with your position) and this resolves once
+     * you're in. Pass { queue: false } to fail with 'room_full' instead. Other options: password, playerData.
+     */
+    joinServer(id, options = {}) { return this.join(id, Object.assign({ queue: true }, options, { mustExist: true })); }
+    /** Give up your place in a server queue (the pending join rejects with 'cancelled'). */
+    async leaveQueue() {
+      const w = this._queueWait; this._queueWait = null;
+      await this.request('queue.leave');
+      if (w) w.reject(new MultiplayerError('cancelled'));
+    }
+    _joined(r) {
+      if (!r || !r.queued) return Promise.resolve(this._applySnapshot(r));
+      if (this._queueWait) this._queueWait.reject(new MultiplayerError('replaced'));
+      const p = new Promise((resolve, reject) => { this._queueWait = { resolve, reject }; });
+      this._emit('queue', { room: r.room, position: r.position });
+      return p;
+    }
     /** Create a new room with a random 6-char code (great for "share this code" lobbies). */
-    async create(options = {}) { this._lastJoinOpts = { password: options.password }; return this._applySnapshot(await this.request('create', { options })); }
+    async create(options = {}) { this._lastJoinOpts = { password: options.password }; return this._joined(await this.request('create', { options })); }
     /** Matchmaking: join the fullest open public room with this tag, or create one. */
-    async quickJoin(tag = '', options = {}) { this._lastJoinOpts = {}; return this._applySnapshot(await this.request('quick', { tag, options })); }
+    async quickJoin(tag = '', options = {}) { this._lastJoinOpts = {}; return this._joined(await this.request('quick', { tag, options })); }
     async leave() { if (!this.room) return; await this.request('leave'); this._resetRoom('left'); }
     listRooms(tag) { return this.request('rooms', { tag }); }
     updateRoom(changes) { return this.request('room.update', changes); }
@@ -672,6 +711,8 @@
 
     get isHost() { return !!this.room && this.room.host === this.playerId; }
     get me() { return this.players.get(this.playerId) || null; }
+    /** Players in the room, including ones out of view in an interest-managed (aoi) room. */
+    get playerCount() { return this.room ? (this.room.playerCount != null ? this.room.playerCount : this.players.size) : 0; }
     get playerList() { return [...this.players.values()]; }
 
     // ---------- shared state ----------

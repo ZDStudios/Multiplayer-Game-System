@@ -11,6 +11,8 @@ import { openDb } from './db.js';
 import { createScripting } from './scripts.js';
 import { createTransports } from './transports.js';
 import { createServices } from './services.js';
+import { createAoi, normalizeAoi } from './aoi.js';
+import { createServers } from './servers.js';
 
 const scrypt = promisify(crypto.scrypt);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -28,7 +30,9 @@ const CFG = {
   rate: +env.RATE_LIMIT || 200,          // sustained msgs/sec per connection
   burst: +env.RATE_BURST || 500,         // bucket size
   grace: +env.RECONNECT_GRACE_MS || 15000,
-  maxRoomPlayers: +env.MAX_ROOM_PLAYERS || 256,
+  maxRoomPlayers: +env.MAX_ROOM_PLAYERS || 1000,      // default per-room cap; a game can raise it up to the hard cap
+  hardMaxRoomPlayers: +env.HARD_MAX_ROOM_PLAYERS || 5000,
+  maxRooms: +env.MAX_ROOMS_PER_GAME || 10000,
   maxConnsPerIp: +env.MAX_CONNS_PER_IP || 50,
   // Extra transports next to the WebSocket (see transports.js). UDP_PORT=0 / WEBRTC=false turn them off.
   udpPort: env.UDP_PORT === '0' ? 0 : +env.UDP_PORT || 8081,
@@ -81,6 +85,20 @@ function createGame(name, settings = {}, key) {
 }
 function saveGame(g) {
   S.gameUpdate.run(g.name, g.key, g.enabled ? 1 : 0, JSON.stringify(g.settings), g.id);
+}
+
+// Per-game overrides of the server-wide limits (settings.limits, edited in the dashboard).
+function limits(game) {
+  const l = isObj(game && game.settings.limits) ? game.settings.limits : {};
+  const pick = (k, def, lo, hi) => (Number.isFinite(+l[k]) && l[k] !== null && l[k] !== '' ? Math.max(lo, Math.min(hi, +l[k])) : def);
+  return {
+    maxRoomPlayers: pick('maxRoomPlayers', Math.min(CFG.maxRoomPlayers, CFG.hardMaxRoomPlayers), 1, CFG.hardMaxRoomPlayers),
+    maxRooms: pick('maxRooms', CFG.maxRooms, 1, 1e6),
+    rate: pick('rateLimit', CFG.rate, 1, 10000),
+    burst: pick('rateBurst', CFG.burst, 1, 100000),
+    grace: pick('reconnectGraceMs', CFG.grace, 0, 3600000),
+    defaultMaxPlayers: pick('defaultMaxPlayers', 16, 1, CFG.hardMaxRoomPlayers),
+  };
 }
 
 // ---------- telemetry ----------
@@ -179,19 +197,57 @@ function broadcast(room, obj, exceptPid, unreliable) {
 }
 const pubPlayer = (m) => ({ id: m.id, name: m.name, data: m.data, connected: m.connected, joined: m.joined, username: m.username || null });
 const rttOf = (m) => (m.client ? m.client.rtt : null);
-const roomInfo = (r) => ({ id: r.id, host: r.host, meta: r.meta, maxPlayers: r.maxPlayers, locked: r.locked,
-  private: r.private, tag: r.tag, stateWrite: r.stateWrite, hasPassword: !!r.password, created: r.created });
-const snapshot = (r) => ({ ...roomInfo(r), players: [...r.players.values()].map(pubPlayer), state: r.state });
+const roomInfo = (r) => ({ id: r.id, host: r.host, meta: r.meta, maxPlayers: r.maxPlayers, playerCount: r.players.size, locked: r.locked,
+  private: r.private, tag: r.tag, type: r.type, stateWrite: r.stateWrite, hasPassword: !!r.password, created: r.created,
+  server: r.server ? r.server.name : undefined, aoi: r.aoi ? { radius: r.aoi.radius, keys: r.aoi.keys } : undefined });
+// With interest management a player's snapshot only holds themself and the players they can see.
+const snapshot = (r, pid) => {
+  const me = pid != null && r.aoi ? r.players.get(pid) : null;
+  const list = me ? [me, ...aoi.watchers(r, me)] : [...r.players.values()];
+  return { ...roomInfo(r), players: list.map(pubPlayer), state: r.state };
+};
+// Everyone who should hear about member `m` (all others, or only those who can see m in an AOI room).
+function* audience(room, m) {
+  if (room.aoi) yield* aoi.watchers(room, m);
+  else for (const o of room.players.values()) if (o !== m) yield o;
+}
+function tell(room, m, obj, unreliable) {
+  const s = JSON.stringify(obj);
+  for (const o of audience(room, m)) if (o.client && o.client.ws.readyState === 1) out(o.client, s, unreliable);
+}
+const roomCounts = new Map(); // gid -> open rooms
 
-function createRoom(game, id, o = {}) {
+// Room options: a named room type from the game settings (its fields win), else the game's roomDefaults.
+// trusted = server-defined (public servers), which skips requireRoomType.
+function roomOptions(game, o = {}, trusted) {
+  const st = game.settings, types = isObj(st.roomTypes) ? st.roomTypes : {};
+  if (o.type != null && o.type !== '') {
+    const t = Object.hasOwn(types, String(o.type)) ? types[String(o.type)] : null;
+    if (!isObj(t)) throw new E('bad_room_type', `Unknown room type: ${o.type}`);
+    const base = t.clientOptions === false ? { password: o.password, playerData: o.playerData } : o;
+    return { ...base, ...t, meta: { ...(isObj(base.meta) ? base.meta : {}), ...(isObj(t.meta) ? t.meta : {}) }, type: String(o.type) };
+  }
+  if (!trusted && st.requireRoomType) throw new E('room_type_required', 'This game only allows its defined room types');
+  return isObj(st.roomDefaults) ? { ...st.roomDefaults, ...o } : o;
+}
+
+function createRoom(game, id, o = {}, trusted) {
+  o = roomOptions(game, o, trusted);
+  const lim = limits(game);
+  if ((roomCounts.get(game.id) || 0) >= lim.maxRooms) throw new E('too_many_rooms');
+  const aoiCfg = normalizeAoi(o.aoi);
+  if (aoiCfg === undefined) throw new E('bad_aoi', "aoi: { radius: number > 0, keys: ['x', 'y'] or ['x', 'y', 'z'] }");
   const room = {
     id, game, players: new Map(), state: isObj(o.state) ? safeMerge({}, o.state) : {}, host: null,
-    meta: isObj(o.meta) ? o.meta : {},
-    maxPlayers: Math.max(1, Math.min(CFG.maxRoomPlayers, Math.floor(+o.maxPlayers) || 16)),
+    meta: isObj(o.meta) ? o.meta : {}, type: o.type != null ? String(o.type) : null,
+    maxPlayers: Math.max(1, Math.min(lim.maxRoomPlayers, Math.floor(+o.maxPlayers) || lim.defaultMaxPlayers)),
     private: !!o.private, locked: false, tag: str(o.tag, 64, ''), persist: !!o.persist,
     stateWrite: o.stateWrite === 'host' ? 'host' : 'all', password: str(o.password, 64, '') || null,
+    queueAllowed: o.queue !== false, waiting: [], whitelist: null, permanent: false,
     created: Date.now(), banned: new Set(),
   };
+  if (aoiCfg) aoi.enable(room, aoiCfg);
+  roomCounts.set(game.id, (roomCounts.get(game.id) || 0) + 1);
   if (room.persist) {
     const saved = S.kvGet.get(game.id, 'room', id, 'state');
     if (saved) room.state = JSON.parse(saved.v);
@@ -208,8 +264,11 @@ function destroyRoom(room, reason = 'empty') {
     if (m.client) { send(m.client, { t: 'left', room: room.id, reason }); m.client.room = null; }
   }
   room.players.clear();
+  for (const w of room.waiting.splice(0)) if (w.c.waitingIn === room) { w.c.waitingIn = null; send(w.c, { t: 'queue.cancelled', room: room.id, reason }); }
   scripts.stopTick(room);
+  aoi.disable(room);
   rooms.delete(rkey(room.game.id, room.id));
+  roomCounts.set(room.game.id, Math.max(0, (roomCounts.get(room.game.id) || 1) - 1));
   log(room.game.id, 'room', `Room ${room.id} closed (${reason})`);
 }
 function pickHost(room) {
@@ -225,20 +284,63 @@ function removeMember(room, pid, reason) {
   const m = room.players.get(pid);
   if (!m) return;
   clearTimeout(m.graceTimer);
+  tell(room, m, { t: 'player.left', id: pid, reason });
+  if (room.aoi) aoi.remove(room, m);
   room.players.delete(pid);
   if (m.client && m.client.room === room) m.client.room = null;
-  broadcast(room, { t: 'player.left', id: pid, reason });
   scripts.call(room, 'onLeave', pubPlayer(m), reason);
-  if (room.players.size === 0) return destroyRoom(room);
+  drainQueue(room);
+  if (room.players.size === 0) return room.permanent ? undefined : destroyRoom(room);
   pickHost(room);
+}
+
+// ---------- join queue (full rooms, mostly public servers) ----------
+function leaveQueue(c, reason) {
+  const room = c.waitingIn;
+  if (!room) return false;
+  c.waitingIn = null;
+  const i = room.waiting.findIndex((w) => w.c === c);
+  if (i >= 0) { room.waiting.splice(i, 1); queuePositions(room, i); }
+  if (reason) send(c, { t: 'queue.cancelled', room: room.id, reason });
+  return true;
+}
+function queuePositions(room, from = 0) {
+  for (let i = from; i < room.waiting.length; i++) send(room.waiting[i].c, { t: 'queue', room: room.id, position: i + 1 });
+}
+function drainQueue(room) {
+  let moved = false;
+  while (room.waiting.length && room.players.size < room.maxPlayers) {
+    const w = room.waiting.shift();
+    moved = true;
+    if (w.c.waitingIn !== room || w.c.ws.readyState !== 1) continue;
+    w.c.waitingIn = null;
+    try { send(w.c, { t: 'queue.joined', room: joinRoom(w.c, room.id, { ...w.o, queue: false }) }); }
+    catch (e) { send(w.c, { t: 'queue.cancelled', room: room.id, reason: e.code || 'join_failed' }); }
+  }
+  if (moved) queuePositions(room);
 }
 function joinRoom(c, id, o = {}) {
   if (!ID_RE.test(id)) throw new E('bad_room_id', 'Room id must match [A-Za-z0-9_-]{1,64}');
-  if (c.room) {
-    if (c.room.id === id) return snapshot(c.room);
-    removeMember(c.room, c.pid, 'left');
-  }
+  if (c.waitingIn && c.waitingIn.id !== id) leaveQueue(c, 'joined_elsewhere');
+  if (c.room && c.room.id === id && c.room.players.has(c.pid)) return snapshot(c.room, c.pid);
   let room = rooms.get(rkey(c.game.id, id));
+  const rejoin = room && room.players.has(c.pid);
+  if (room && !rejoin) { // checks before leaving the current room, so a refused join keeps you where you are
+    if (room.banned.has(c.pid)) throw new E('banned');
+    if (room.locked) throw new E('room_locked');
+    if (room.whitelist && !room.whitelist.has(c.pid) && !(c.username && room.whitelist.has(c.username))) throw new E('not_whitelisted');
+    if (room.password && o.password !== room.password) throw new E('bad_password');
+    if (room.players.size >= room.maxPlayers) {
+      if (!o.queue || !room.queueAllowed) throw new E('room_full');
+      if (c.waitingIn !== room) {
+        if (room.waiting.length >= 10000) throw new E('queue_full');
+        room.waiting.push({ c, o: { password: o.password, playerData: o.playerData } });
+        c.waitingIn = room;
+      }
+      return { queued: true, room: id, position: room.waiting.findIndex((w) => w.c === c) + 1 };
+    }
+  }
+  if (c.room) removeMember(c.room, c.pid, 'left');
   if (!room) {
     if (o.mustExist) throw new E('room_not_found');
     room = createRoom(c.game, id, o);
@@ -248,25 +350,24 @@ function joinRoom(c, id, o = {}) {
     clearTimeout(m.graceTimer);
     if (m.client && m.client !== c) send(m.client, { t: 'left', room: id, reason: 'replaced' });
     Object.assign(m, { client: c, connected: true, name: c.name });
-    broadcast(room, { t: 'player.connection', id: c.pid, connected: true }, c.pid);
+    tell(room, m, { t: 'player.connection', id: c.pid, connected: true });
   } else {
-    if (room.banned.has(c.pid)) throw new E('banned');
-    if (room.locked) throw new E('room_locked');
-    if (room.players.size >= room.maxPlayers) throw new E('room_full');
-    if (room.password && o.password !== room.password) throw new E('bad_password');
     m = { id: c.pid, name: c.name, username: c.username, data: isObj(o.playerData) ? safeMerge({}, o.playerData) : {},
       connected: true, joined: Date.now(), client: c, graceTimer: null };
     room.players.set(c.pid, m);
-    broadcast(room, { t: 'player.joined', player: pubPlayer(m) }, c.pid);
+    if (room.aoi) { aoi.place(room, m); aoi.refresh(room, m, true); } // neighbours hear about us; we get them in the snapshot
+    else broadcast(room, { t: 'player.joined', player: pubPlayer(m) }, c.pid);
     if (scripts.has(c.game.id)) { c.room = room; pickHost(room); scripts.call(room, 'onJoin', pubPlayer(m)); }
   }
   c.room = room;
   pickHost(room);
-  return snapshot(room);
+  return snapshot(room, c.pid);
 }
+const aoi = createAoi({ send, pubPlayer });
 const services = createServices({ db: store.db, E, online, rkey, send, out, isObj, str, safeMerge, ID_RE, KEY_RE, BAD_KEYS, CFG,
   newCode, joinRoom, snapshot });
-const scripts = createScripting({ log, broadcast, send, setPath, removeMember, pubPlayer, E, services });
+const servers = createServers({ db: store.db, E, rooms, rkey, createRoom, destroyRoom, drainQueue, isObj, str, log, games, limits });
+const scripts = createScripting({ log, broadcast, send, setPath, removeMember, pubPlayer, E, services, aoi });
 for (const g of games.values()) if (g.settings.script) scripts.load(g);
 
 function onDisconnect(c) {
@@ -275,9 +376,9 @@ function onDisconnect(c) {
   const m = room.players.get(c.pid);
   if (!m || m.client !== c) return;
   m.client = null; m.connected = false;
-  broadcast(room, { t: 'player.connection', id: c.pid, connected: false });
+  tell(room, m, { t: 'player.connection', id: c.pid, connected: false });
   pickHost(room);
-  m.graceTimer = setTimeout(() => removeMember(room, c.pid, 'disconnected'), CFG.grace);
+  m.graceTimer = setTimeout(() => removeMember(room, c.pid, 'disconnected'), limits(room.game).grace);
 }
 const needRoom = (c) => { if (!c.room) throw new E('not_in_room'); return c.room; };
 const needHost = (c) => { const r = needRoom(c); if (r.host !== c.pid) throw new E('not_host'); return r; };
@@ -300,7 +401,7 @@ const H = {
     c.name = name;
     S.playerTouch.run(c.game.id, c.pid, name, Date.now(), Date.now());
     const mem = c.room && c.room.players.get(c.pid);
-    if (mem) { mem.name = name; broadcast(c.room, { t: 'player', id: c.pid, name }, c.pid); }
+    if (mem) { mem.name = name; tell(c.room, mem, { t: 'player', id: c.pid, name }); }
     return { name };
   },
 
@@ -310,21 +411,23 @@ const H = {
   quick(c, m) {
     const o = isObj(m.options) ? m.options : {};
     const tag = str(m.tag, 64, '');
+    const type = o.type != null && o.type !== '' ? String(o.type) : null;
     let best = null;
     for (const r of rooms.values()) {
-      if (r.game !== c.game || r.private || r.locked || r.password || r.tag !== tag) continue;
+      if (r.game !== c.game || r.private || r.locked || r.password || r.whitelist || r.tag !== tag || r.type !== type) continue;
       if (r.players.size >= r.maxPlayers || r.banned.has(c.pid)) continue;
       if (!best || r.players.size > best.players.size) best = r;
     }
-    return joinRoom(c, best ? best.id : newCode(c.game.id), { ...o, tag });
+    return joinRoom(c, best ? best.id : newCode(c.game.id), { ...o, tag, queue: false });
   },
   leave(c) { if (c.room) removeMember(c.room, c.pid, 'left'); return true; },
+  'queue.leave'(c) { return leaveQueue(c); },
 
   'room.update'(c, m) {
     const r = needHost(c);
     if (m.locked != null) r.locked = !!m.locked;
     if (m.private != null) r.private = !!m.private;
-    if (m.maxPlayers != null) r.maxPlayers = Math.max(1, Math.min(CFG.maxRoomPlayers, Math.floor(+m.maxPlayers) || r.maxPlayers));
+    if (m.maxPlayers != null && !r.server) r.maxPlayers = Math.max(1, Math.min(limits(c.game).maxRoomPlayers, Math.floor(+m.maxPlayers) || r.maxPlayers));
     if (m.stateWrite != null) r.stateWrite = m.stateWrite === 'host' ? 'host' : 'all';
     if (isObj(m.meta)) safeMerge(r.meta, m.meta);
     if (m.host != null) {
@@ -333,6 +436,7 @@ const H = {
       r.host = t.id; broadcast(r, { t: 'host', id: t.id });
     }
     broadcast(r, { t: 'room', room: roomInfo(r) });
+    drainQueue(r);
     return roomInfo(r);
   },
   kick(c, m) {
@@ -373,7 +477,8 @@ const H = {
     if (m.replace) mem.data = safeMerge({}, m.data); else safeMerge(mem.data, m.data);
     const msg = { t: 'player', id: c.pid, data: m.data, replace: !!m.replace };
     if (seq != null) msg.s = seq;
-    broadcast(r, msg, c.pid, unreliable);
+    if (r.aoi) aoi.place(r, mem);
+    tell(r, mem, msg, unreliable);
     return true;
   },
   send(c, m, unreliable) {
@@ -383,7 +488,7 @@ const H = {
       if (typeof to !== 'string') throw new E('not_in_room');
       const target = online.get(rkey(c.game.id, to));
       if (!target) throw new E('player_offline');
-    if (target.blocked && target.blocked.has(c.pid)) throw new E('blocked');
+      if (target.blocked && target.blocked.has(c.pid)) throw new E('blocked');
       msg.direct = true;
       send(target, msg, unreliable);
       return true;
@@ -395,6 +500,11 @@ const H = {
       return true;
     }
     if (to == null || to === 'all') return broadcast(r, msg, m.self ? null : c.pid, unreliable), true;
+    if (to === 'nearby') { // everyone who can see me (everyone else in a room without interest management)
+      tell(r, r.players.get(c.pid), msg, unreliable);
+      if (m.self) send(c, msg, unreliable);
+      return true;
+    }
     const ids = to === 'host' ? [r.host] : Array.isArray(to) ? to.slice(0, 256) : [to];
     for (const id of ids) {
       const t = r.players.get(String(id));
@@ -440,7 +550,7 @@ const H = {
     return { playerId: c.pid, token: makeToken(c.game.id, c.pid), username: u, name: c.name };
   },
 };
-Object.assign(H, services.handlers);
+Object.assign(H, services.handlers, servers.handlers);
 
 function claimIdentity(c, pid) {
   const k = rkey(c.game.id, pid);
@@ -485,7 +595,8 @@ function onLegacyMessage(c, raw) {
 async function onMessage(c, m, size, unreliable) {
   // token bucket
   const now = Date.now();
-  c.tokens = Math.min(CFG.burst, c.tokens + ((now - c.lastRefill) / 1000) * CFG.rate);
+  const lim = c.game ? limits(c.game) : CFG;
+  c.tokens = Math.min(lim.burst, c.tokens + ((now - c.lastRefill) / 1000) * lim.rate);
   c.lastRefill = now;
   if (c.tokens < 1) {
     if (++c.dropped > 2000) return c.ws.close(4029, 'rate_limited');
@@ -608,10 +719,10 @@ async function admin(req, res, parts, url) {
     const counts = new Map(S.playerCounts.all().map((r) => [r.game, r.n]));
     return json(res, 200, {
       ...gameSummary(g, counts), accounts: S.accCount.get(g.id).n, kvEntries: S.kvCount.get(g.id).n,
-      rooms: [...rooms.values()].filter((r) => r.game === g).map((r) => ({ ...roomInfo(r), persist: r.persist,
+      rooms: [...rooms.values()].filter((r) => r.game === g).map((r) => ({ ...roomInfo(r), persist: r.persist, permanent: r.permanent, queue: r.waiting.length,
         players: [...r.players.values()].map((m) => ({ ...pubPlayer(m), rtt: rttOf(m), transport: m.client ? net.active(m.client) : null, data: trunc(m.data, 2000) })), state: trunc(r.state) })),
       recentPlayers: S.playersRecent.all(g.id, 50).map((p) => ({ ...p, online: online.has(rkey(g.id, p.id)) })),
-      leaderboards: services.summary(g.id), ...services.stats(g.id),
+      leaderboards: services.summary(g.id), ...services.stats(g.id), servers: servers.summary(g), limits: limits(g),
     });
   }
   if (sub === 'rooms' && sid && method === 'POST') {
@@ -687,6 +798,10 @@ async function admin(req, res, parts, url) {
   if (sub === 'leaderboards') {
     const b = method === 'PUT' || method === 'POST' ? await readBody(req) : {};
     return json(res, 200, services.adminLeaderboards(g, method, sid, act, parts[7], b, url));
+  }
+  if (sub === 'servers') {
+    const b = method === 'POST' || method === 'PATCH' ? await readBody(req) : {};
+    return json(res, method === 'POST' && !sid ? 201 : 200, servers.admin(g, method, sid, b));
   }
   if (sub === 'inbox' && method === 'POST') { // { to: playerId | [ids], type, data }
     const b = await readBody(req);
@@ -770,6 +885,7 @@ wss.on('connection', (ws, req) => {
     if (!c.game) return;
     if (online.get(rkey(c.game.id, c.pid)) === c) online.delete(rkey(c.game.id, c.pid));
     services.onOffline(c);
+    leaveQueue(c);
     onDisconnect(c);
   });
   ws.on('error', () => {});
@@ -782,6 +898,12 @@ setInterval(() => {
   }
 }, 5000).unref(); // also measures each client's RTT (shown in the dashboard)
 
+// Push player-count changes (at most every 2 s): in AOI rooms clients can't count the players themselves.
+setInterval(() => {
+  for (const r of rooms.values()) if (r.lastCount !== r.players.size) { r.lastCount = r.players.size; broadcast(r, { t: 'room', room: { playerCount: r.players.size } }); }
+}, 2000).unref();
+
+servers.boot();
 server.listen(CFG.port, () => {
   const t = net.info();
   console.log(`[mp] listening on :${CFG.port}  (ws path /ws, dashboard /, sdk /sdk.js, data ${CFG.dataDir})`);
