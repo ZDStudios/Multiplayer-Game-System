@@ -38,7 +38,7 @@ MULTIPLAYER.md  Integration guide to hand to any Claude chat
 
 ```bash
 ssh root@YOUR_VPS_IP
-git clone <your-repo-url> mp && cd mp       # or scp this folder up
+git clone https://github.com/ZDStudios/Multiplayer-Game-System.git mp && cd mp       # or scp this folder up
 sh deploy.sh
 ```
 
