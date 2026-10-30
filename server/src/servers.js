@@ -141,5 +141,12 @@ export function createServers(d) {
     throw new E('not_found');
   }
 
-  return { boot, handlers, admin, summary: (g) => serversOf(g).map((r) => info(r)) };
+  // Check a server config (new, or a partial update of an existing one) without changing anything.
+  function validate(g, b, i) {
+    const row = S.all.all().find((r) => r.game === g.id && r.id === b.id);
+    try { normalize(g, b, row ? JSON.parse(row.config) : {}); }
+    catch (e) { throw new E(e.code || 'bad_setup', `servers[${i}]: ${e.message}`); }
+  }
+
+  return { boot, handlers, admin, validate, summary: (g) => serversOf(g).map((r) => info(r)) };
 }

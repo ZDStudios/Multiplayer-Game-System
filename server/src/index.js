@@ -13,6 +13,7 @@ import { createTransports } from './transports.js';
 import { createServices } from './services.js';
 import { createAoi, normalizeAoi } from './aoi.js';
 import { createServers } from './servers.js';
+import { createSetup } from './setup.js';
 
 const scrypt = promisify(crypto.scrypt);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -71,7 +72,8 @@ function loadGame(row) {
     settings: JSON.parse(row.settings || '{}') };
   games.set(g.id, g);
   gamesByKey.set(g.key, g);
-  if (!gameStats.has(g.id)) gameStats.set(g.id, { msgs: 0, rate: 0, peak: 0, lastActive: 0 });
+  if (!gameStats.has(g.id)) gameStats.set(g.id, { msgs: 0, rate: 0, peak: 0, lastActive: 0, minutes: [], acc: 0, accN: 0, accMax: 0 });
+  if (!g.settings.setupKey) { g.settings.setupKey = 'sk_' + rid(18); saveGame(g); } // for the setup API (coding agents)
   return g;
 }
 for (const row of S.gamesAll.all()) loadGame(row);
@@ -118,8 +120,16 @@ setInterval(() => {
   const perGame = new Map();
   for (const c of online.values()) perGame.set(c.game.id, (perGame.get(c.game.id) || 0) + 1);
   for (const [id, s] of gameStats) {
+    const n = perGame.get(id) || 0;
     s.rate = s.msgs; s.msgs = 0;
-    s.peak = Math.max(s.peak, perGame.get(id) || 0);
+    s.peak = Math.max(s.peak, n);
+    // Per-minute averages of players online, kept for 24 h (dashboard: expected vs measured).
+    s.acc += n; s.accN++; s.accMax = Math.max(s.accMax, n);
+    if (s.accN >= 60) {
+      s.minutes.push({ t: now, avg: s.acc / s.accN, max: s.accMax });
+      if (s.minutes.length > 1440) s.minutes.shift();
+      s.acc = s.accN = s.accMax = 0;
+    }
   }
 }, 1000).unref();
 
@@ -369,6 +379,7 @@ const services = createServices({ db: store.db, E, online, rkey, send, out, isOb
 const servers = createServers({ db: store.db, E, rooms, rkey, createRoom, destroyRoom, drainQueue, isObj, str, log, games, limits });
 const scripts = createScripting({ log, broadcast, send, setPath, removeMember, pubPlayer, E, services, aoi });
 for (const g of games.values()) if (g.settings.script) scripts.load(g);
+const setup = createSetup({ db: store.db, E, games, saveGame, isObj, str, safeMerge, services, servers, scripts, setScript, metrics, log, rooms, online });
 
 function onDisconnect(c) {
   const room = c.room;
@@ -655,6 +666,73 @@ function isAdmin(req, ip) {
   adminFails.set(ip, { n: (f && Date.now() - f.t < 600000 ? f.n : 0) + 1, t: Date.now() });
   return false;
 }
+// Measured numbers for one game: players online (now / averages / peaks), traffic per player, ping, room sizes.
+function metrics(g) {
+  const st = gameStats.get(g.id), now = Date.now();
+  const window = (ms) => {
+    const m = st.minutes.filter((x) => now - x.t <= ms);
+    if (st.accN) m.push({ avg: st.acc / st.accN, max: st.accMax });
+    return m.length ? { avg: Math.round((m.reduce((a, x) => a + x.avg, 0) / m.length) * 10) / 10, peak: Math.max(...m.map((x) => x.max)) } : { avg: null, peak: null };
+  };
+  let on = 0, pingSum = 0, pings = 0;
+  for (const c of online.values()) if (c.game === g) { on++; if (typeof c.rtt === 'number') { pingSum += c.rtt; pings++; } }
+  const sizes = [...rooms.values()].filter((r) => r.game === g && r.players.size).map((r) => r.players.size); // empty public servers don't count
+  const h1 = window(3600000), h24 = window(86400000);
+  return {
+    online: on, avg1h: h1.avg, avg24h: h24.avg, peak1h: h1.peak, peak24h: h24.peak, peakSinceStart: st.peak,
+    msgsPerSecond: st.rate, msgsPerPlayer: on ? Math.round((st.rate / on) * 10) / 10 : 0,
+    avgPing: pings ? Math.round(pingSum / pings) : null,
+    rooms: sizes.length, largestRoom: sizes.length ? Math.max(...sizes) : 0,
+    avgRoomSize: sizes.length ? Math.round((sizes.reduce((a, b) => a + b, 0) / sizes.length) * 10) / 10 : 0,
+    sampledMinutes: st.minutes.length,
+  };
+}
+// Install / replace / remove a game's server script (admin API and setup API).
+function setScript(g, code) {
+  if (code.length > 512 * 1024) throw new E('too_large');
+  g.settings.script = code || undefined;
+  saveGame(g);
+  for (const r of rooms.values()) if (r.game === g) { scripts.stopTick(r); r.api = null; }
+  const s = code ? scripts.load(g) : (scripts.unload(g.id), null);
+  if (s && !s.failed) for (const r of rooms.values()) if (r.game === g) scripts.startTick(r);
+  log(g.id, 'admin', code ? 'Server script updated' : 'Server script removed');
+  return scripts.info(g.id);
+}
+// Setup API auth: a game's setup key, with the same brute-force throttle as the admin token.
+function setupAuth(req, ip) {
+  const f = adminFails.get(ip);
+  if (f && f.n >= 20 && Date.now() - f.t < 600000) throw new E('rate_limited');
+  const h = String(req.headers.authorization || '');
+  const g = setup.gameFor(h.startsWith('Bearer ') ? h.slice(7) : '');
+  if (g) return g;
+  adminFails.set(ip, { n: (f && Date.now() - f.t < 600000 ? f.n : 0) + 1, t: Date.now() });
+  return null;
+}
+// asAdmin: the dashboard (admin token) — never locked out, and its chat messages come from the user.
+async function setupRoute(g, req, sub, url, asAdmin, res) {
+  const m = req.method;
+  if (!asAdmin) {
+    if (g.settings.setupDisabled) throw new E('setup_closed', 'Setup is finished and the setup API is closed. Game settings can only be changed in the dashboard (it can re-open setup).');
+    setup.touch(g);
+  }
+  if (sub === 'messages') {
+    if (m === 'POST') { const b = await readBody(req); return setup.post(g, asAdmin ? 'admin' : 'agent', b.text); }
+    const after = Math.max(0, Math.floor(+url.searchParams.get('after') || 0));
+    const wait = asAdmin ? 0 : +url.searchParams.get('wait') || 0;
+    return { status: setup.status(g), messages: await setup.read(g, after, wait, (fn) => res.on('close', fn)) };
+  }
+  if (asAdmin && sub === 'reopen' && m === 'POST') return setup.reopen(g, 'sk_' + rid(18));
+  if (sub === 'done' && m === 'POST') { const b = await readBody(req); return setup.finish(g, b.summary); }
+  if (!sub && m === 'GET') return setup.view(g);
+  if (sub === 'recommend' && m === 'POST') { const b = await readBody(req); return setup.recommend(isObj(b.profile) ? b.profile : b); }
+  if (!sub && (m === 'PUT' || m === 'POST')) {
+    const b = await readBody(req);
+    const dry = url.searchParams.get('dryRun') === '1' || url.searchParams.get('dryRun') === 'true' || b.dryRun === true;
+    return setup.apply(g, b, dry);
+  }
+  throw new E('not_found', 'Setup API: GET /api/setup · POST /api/setup/recommend · PUT /api/setup[?dryRun=1] · GET|POST /api/setup/messages · POST /api/setup/done');
+}
+
 const gameSummary = (g, counts) => {
   let on = 0, rc = 0;
   for (const c of online.values()) if (c.game === g) on++;
@@ -662,7 +740,8 @@ const gameSummary = (g, counts) => {
   const st = gameStats.get(g.id);
   const { script, ...settings } = g.settings;
   return { id: g.id, name: g.name, key: g.key, enabled: g.enabled, created: g.created, settings, hasScript: !!script, scriptOk: scripts.has(g.id),
-    online: on, rooms: rc, totalPlayers: counts.get(g.id) || 0, msgRate: st.rate, peak: st.peak, lastActive: st.lastActive };
+    online: on, rooms: rc, totalPlayers: counts.get(g.id) || 0, msgRate: st.rate, peak: st.peak, lastActive: st.lastActive,
+    avgPlayers1h: metrics(g).avg1h, expected: g.settings.profile ? g.settings.profile.players : null };
 };
 const trunc = (v, n = 20000) => { const s = JSON.stringify(v); return s.length > n ? s.slice(0, n) + '…(truncated)' : s; };
 
@@ -712,6 +791,7 @@ async function admin(req, res, parts, url) {
         if ('config' in b.settings) services.pushConfig(g, online.values()); // remote config goes live at once
       }
       if (b.rotateKey) { gamesByKey.delete(g.key); g.key = 'pk_' + rid(18); gamesByKey.set(g.key, g); }
+      if (b.rotateSetupKey) g.settings.setupKey = 'sk_' + rid(18);
       saveGame(g);
       log(g.id, 'game', `Game updated: ${g.name}`);
       return json(res, 200, gameSummary(g, new Map()));
@@ -719,6 +799,7 @@ async function admin(req, res, parts, url) {
     const counts = new Map(S.playerCounts.all().map((r) => [r.game, r.n]));
     return json(res, 200, {
       ...gameSummary(g, counts), accounts: S.accCount.get(g.id).n, kvEntries: S.kvCount.get(g.id).n,
+      metrics: metrics(g),
       rooms: [...rooms.values()].filter((r) => r.game === g).map((r) => ({ ...roomInfo(r), persist: r.persist, permanent: r.permanent, queue: r.waiting.length,
         players: [...r.players.values()].map((m) => ({ ...pubPlayer(m), rtt: rttOf(m), transport: m.client ? net.active(m.client) : null, data: trunc(m.data, 2000) })), state: trunc(r.state) })),
       recentPlayers: S.playersRecent.all(g.id, 50).map((p) => ({ ...p, online: online.has(rkey(g.id, p.id)) })),
@@ -748,16 +829,12 @@ async function admin(req, res, parts, url) {
     if (method === 'GET') return json(res, 200, { code: g.settings.script || '', ...scripts.info(g.id) });
     if (method === 'PUT' || method === 'DELETE') {
       const b = method === 'PUT' ? await readBody(req) : {};
-      const code = method === 'PUT' ? String(b.code ?? '') : '';
-      if (code.length > 512 * 1024) throw new E('too_large');
-      g.settings.script = code || undefined;
-      saveGame(g);
-      for (const r of rooms.values()) if (r.game === g) { scripts.stopTick(r); r.api = null; }
-      const s = code ? scripts.load(g) : (scripts.unload(g.id), null);
-      if (s && !s.failed) for (const r of rooms.values()) if (r.game === g) scripts.startTick(r);
-      log(g.id, 'admin', code ? 'Server script updated' : 'Server script removed');
-      return json(res, s && s.failed ? 400 : 200, scripts.info(g.id));
+      const info = setScript(g, method === 'PUT' ? String(b.code ?? '') : '');
+      return json(res, info.failed ? 400 : 200, info);
     }
+  }
+  if (sub === 'setup') { // the admin can use the setup API for any game: GET, PUT (?dryRun=1), POST setup/recommend
+    return json(res, 200, await setupRoute(g, req, sid, url, true, res));
   }
   if (sub === 'players' && sid && method === 'POST') {
     const b = act === 'kick' ? await readBody(req) : {};
@@ -834,6 +911,11 @@ const server = http.createServer(async (req, res) => {
   const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
   try {
     if (url.pathname === '/health') return json(res, 200, { ok: true, uptime: Date.now() - started, online: online.size, rooms: rooms.size });
+    if (parts[0] === 'api' && parts[1] === 'setup') {
+      const g = setupAuth(req, clientIp(req));
+      if (!g) return json(res, 401, { error: 'unauthorized', message: 'Send Authorization: Bearer <setup key> (dashboard -> game -> Setup)' });
+      return json(res, 200, await setupRoute(g, req, parts[2], url, false, res));
+    }
     if (parts[0] === 'api' && parts[1] === 'admin') {
       if (!isAdmin(req, clientIp(req))) return json(res, 401, { error: 'unauthorized' });
       return await admin(req, res, parts, url);
@@ -848,7 +930,7 @@ const server = http.createServer(async (req, res) => {
     }
     json(res, 404, { error: 'not_found' });
   } catch (e) {
-    const code = e.code === 'not_found' ? 404 : e.code === 'rate_limited' ? 429 : e instanceof E ? 400 : 500;
+    const code = e.code === 'not_found' ? 404 : e.code === 'rate_limited' ? 429 : e.code === 'setup_closed' ? 403 : e instanceof E ? 400 : 500;
     if (code === 500) console.error('[mp] http error', e);
     json(res, code, { error: e.code || 'internal', message: e instanceof E ? e.message : 'Internal error' });
   }

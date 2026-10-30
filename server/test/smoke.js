@@ -402,6 +402,86 @@ try {
   oldc.disconnect();
 
   }
+  // ---- setup API (for coding agents) ----
+  {
+    const sapi = async (method, p, body, key) => {
+      const r = await fetch(BASE + '/api/setup' + p, { method, headers: { authorization: 'Bearer ' + key, 'content-type': 'application/json' }, body: body && JSON.stringify(body) });
+      return { status: r.status, body: await r.json() };
+    };
+    const detail0 = (await api('GET', `/games/${game.id}`)).body;
+    const sk = detail0.settings.setupKey;
+    assert.match(sk, /^sk_/);
+    assert.equal((await sapi('GET', '', null, 'sk_wrong')).status, 401);
+    assert.equal((await sapi('GET', '', null, game.key)).status, 401);
+    const v0 = (await sapi('GET', '', null, sk)).body;
+    assert.equal(v0.game.id, game.id); assert.ok(v0.schema.profile.players && typeof v0.metrics.online === 'number'); ok('setup: per-game setup key (not the public key) opens the setup API with schema + metrics');
+    const other = (await api('POST', '/games', { name: 'Other' })).body;
+    const otherSk = (await api('GET', `/games/${other.id}`)).body.settings.setupKey;
+    assert.equal((await sapi('GET', '', null, otherSk)).body.game.id, other.id); ok('setup: each key only reaches its own game');
+
+    const profile = { genre: 'open-world survival', sessionType: 'open-world', players: { average: 120, peak: 400, perRoom: 200 }, movement: '2d',
+      worldSize: 4000, sendRate: 20, tickRate: 10, latencyTarget: 100, regions: ['au'], competitive: true, dataModel: { player: { x: 'number', y: 'number', hp: 'number' } } };
+    const rec = (await sapi('POST', '/recommend', { profile }, sk)).body;
+    assert.equal(rec.setup.roomTypes.world.aoi.radius, 874);
+    assert.deepEqual(rec.setup.servers.map((x) => x.id), ['au-1', 'au-2']);
+    assert.equal(rec.setup.storage.playerDataWrite, 'none'); assert.equal(rec.estimates.playersSeenPerClient, 30);
+    assert.ok(rec.notes.some((n) => /Interest management/.test(n))); ok('setup: recommend sizes aoi, servers, rate limits and anti-cheat from the profile');
+
+    const dry = (await sapi('PUT', '?dryRun=1', rec.setup, sk)).body;
+    assert.equal(dry.dryRun, true); assert.ok(dry.applied.includes('roomTypes'));
+    assert.equal((await api('GET', `/games/${game.id}/servers`)).body.length, 0); ok('setup: dryRun validates without changing anything');
+    const bad = await sapi('PUT', '', { roomTypes: { broken: { aoi: { radius: -5 } } }, limits: { maxRoomPlayers: 10 } }, sk);
+    assert.equal(bad.status, 400); assert.match(bad.body.message, /roomTypes\.broken\.aoi/);
+    assert.equal((await api('GET', `/games/${game.id}`)).body.settings.limits, undefined);
+    assert.equal((await sapi('PUT', '', { maxPlayerz: 5 }, sk)).body.error, 'bad_setup');
+    assert.equal((await sapi('PUT', '', { script: 'module.exports = {' }, sk)).body.error, 'bad_script'); ok('setup: invalid documents are rejected whole (nothing half-applied)');
+
+    const done = (await sapi('PUT', '', { ...rec.setup, script: 'module.exports = { tickRate: 10, onTick() {} };' }, sk)).body;
+    assert.deepEqual(done.servers.created, ['au-1', 'au-2']); assert.ok(done.applied.includes('script')); assert.equal(done.script.loaded, true);
+    const cl = new Multiplayer({ url: BASE, key: game.key, transports: ['websocket'] }); await cl.connect();
+    assert.equal((await cl.servers.list({ region: 'au' })).length, 2);
+    const wr = await cl.create({ type: 'world' });
+    assert.equal(wr.maxPlayers, 200); assert.equal(wr.aoi.radius, 874);
+    await assert.rejects(cl.storage.set('gold', 1), { code: 'forbidden' }); ok('setup: apply creates servers, room types, limits, storage rules and the script');
+    const v1 = (await sapi('GET', '', null, sk)).body;
+    assert.equal(v1.profile.players.peak, 400); assert.ok(v1.setupApplied); assert.equal(v1.estimates.playersSeenPerClient, 30);
+    const g1 = (await api('GET', `/games/${game.id}`)).body;
+    assert.equal(g1.settings.profile.sendRate, 20); assert.ok(g1.metrics.online >= 1 && 'avg1h' in g1.metrics);
+    assert.equal((await api('GET', '/overview')).body.games.find((x) => x.id === game.id).expected.average, 120); ok('setup: profile + measured metrics in the admin API (dashboard table)');
+    const re = (await sapi('PUT', '', { servers: [{ id: 'au-1', name: 'AU Main' }], replaceServers: true }, sk)).body;
+    assert.deepEqual([re.servers.updated, re.servers.deleted], [['au-1'], ['au-2']]); ok('setup: replaceServers updates and removes servers');
+    await api('PATCH', `/games/${game.id}`, { rotateSetupKey: true });
+    assert.equal((await sapi('GET', '', null, sk)).status, 401); ok('setup: rotating the key revokes the old one');
+    // setup chat + done
+    const sk2 = (await api('GET', `/games/${game.id}`)).body.settings.setupKey;
+    const said = (await sapi('POST', '/messages', { text: 'Found a 2D arena game. Plan: 12 per room. Use ranked matchmaking?' }, sk2)).body;
+    assert.ok(said.id);
+    const seenAdmin = (await api('GET', `/games/${game.id}/setup/messages`)).body;
+    assert.equal(seenAdmin.messages.at(-1).sender, 'agent'); assert.equal(seenAdmin.status, 'in_progress'); ok('setup chat: agent message shows in the dashboard, status in_progress');
+    const t0 = Date.now();
+    const poll = sapi('GET', `/messages?after=${said.id}&wait=10`, null, sk2);
+    await sleep(200);
+    await api('POST', `/games/${game.id}/setup/messages`, { text: 'Yes, ranked please.' });
+    const reply = (await poll).body;
+    assert.equal(reply.messages[0].sender, 'admin'); assert.equal(reply.messages[0].text, 'Yes, ranked please.'); assert.ok(Date.now() - t0 < 3000); ok('setup chat: agent long-poll returns as soon as the user replies');
+    const fin = (await sapi('POST', '/done', { summary: 'Configured match rooms of 12 + ranked board. Done.' }, sk2)).body;
+    assert.equal(fin.done, true);
+    for (const [m, path, body] of [['GET', ''], ['PUT', '', { config: { x: 1 } }], ['POST', '/messages', { text: 'hi' }], ['POST', '/recommend', { profile: {} }]]) {
+      const r = await sapi(m, path, body, sk2);
+      assert.equal(r.status, 403); assert.equal(r.body.error, 'setup_closed');
+    }
+    assert.equal((await api('PUT', `/games/${game.id}/setup`, { config: { fromDashboard: true } })).status, 200);
+    const vDone = (await api('GET', `/games/${game.id}/setup`)).body;
+    assert.equal(vDone.status, 'done'); assert.match(vDone.chat.at(-1).text, /Configured match rooms/); ok('setup done: setup API closed (403 setup_closed), dashboard still changes settings');
+    const reo = (await api('POST', `/games/${game.id}/setup/reopen`)).body;
+    assert.notEqual(reo.setupKey, sk2);
+    assert.equal((await sapi('GET', '', null, sk2)).status, 401);
+    assert.equal((await sapi('GET', '', null, reo.setupKey)).body.status, 'in_progress'); ok('setup re-open: new key works, the old one stays dead');
+    // back to an open configuration for the remaining tests
+    await api('PUT', `/games/${game.id}/setup`, { requireRoomType: false, roomTypes: {}, limits: {}, storage: { playerDataWrite: 'all', gameDataWrite: 'all' }, lockLeaderboards: false, script: '', servers: [], replaceServers: true });
+    cl.disconnect();
+  }
+
   // ---- transports ----
   const tw = new Multiplayer({ url: BASE, key: game.key, transports: ['websocket'] });
   await tw.connect({ room: 'NET' });

@@ -98,7 +98,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
       </div>
       <div class="panel" style="margin-top:12px">
         <h2>Games <span class="sp"></span><button class="sm primary" id="newGame">+ New game</button></h2>
-        <div class="tablewrap"><table><thead><tr><th></th><th>Game</th><th>Online</th><th>Rooms</th><th>Msgs/s</th><th>Peak</th><th>All-time players</th><th>Last active</th><th></th></tr></thead><tbody id="games"></tbody></table></div>
+        <div class="tablewrap"><table><thead><tr><th></th><th>Game</th><th>Online</th><th>Avg players (1h)</th><th>Rooms</th><th>Msgs/s</th><th>Peak</th><th>All-time players</th><th>Last active</th><th></th></tr></thead><tbody id="games"></tbody></table></div>
       </div>
     </div>
     <div class="panel" id="playersPanel" style="margin-top:12px">
@@ -124,7 +124,7 @@ const copy = (s) => navigator.clipboard.writeText(s).then(() => toast('Copied'))
 const LS = { get: (k) => { try { return localStorage.getItem(k); } catch { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch {} }, del: (k) => { try { localStorage.removeItem(k); } catch {} } };
 
 let SERVER = LS.get('mp_server') || '', TOKEN = LS.get('mp_admin') || '';
-let current = null, timer = null, lastOverview = null, detailTab = 'rooms';
+let current = null, timer = null, lastOverview = null, detailTab = 'setup';
 const qs = new URLSearchParams(location.search);
 if (qs.get('server')) SERVER = qs.get('server');
 if (!SERVER && /^https?:$/.test(location.protocol) && !location.hostname.endsWith('github.io')) SERVER = location.origin;
@@ -186,9 +186,9 @@ function renderOverview(o) {
   $('#games').innerHTML = o.games.map((g) => `<tr class="click" data-id="${esc(g.id)}">
     <td><span class="dot ${!g.enabled ? 'off' : g.online ? 'on' : ''}"></span></td>
     <td><b>${esc(g.name)}</b> <span class="mute mono">${esc(g.id)}</span>${g.enabled ? '' : ' <span class="tag bad">disabled</span>'}</td>
-    <td>${num(g.online)}</td><td>${num(g.rooms)}</td><td>${num(g.msgRate)}</td><td>${num(g.peak)}</td><td>${num(g.totalPlayers)}</td><td class="mute">${ago(g.lastActive)}</td>
+    <td>${num(g.online)}</td><td>${g.avgPlayers1h == null ? '<span class="mute">—</span>' : num(g.avgPlayers1h)}${g.expected && g.expected.average != null ? ` <span class="mute">/ ${num(g.expected.average)} expected</span>` : ''}</td><td>${num(g.rooms)}</td><td>${num(g.msgRate)}</td><td>${num(g.peak)}</td><td>${num(g.totalPlayers)}</td><td class="mute">${ago(g.lastActive)}</td>
     <td>${g.enabled ? `<button class="sm danger" data-power="${esc(g.id)}" data-on="0">⏻ Shut down</button>` : `<button class="sm" data-power="${esc(g.id)}" data-on="1">▶ Start</button>`}</td></tr>`).join('')
-    || `<tr><td colspan="9" class="empty">No games yet — create one to get a key.</td></tr>`;
+    || `<tr><td colspan="10" class="empty">No games yet — create one to get a key.</td></tr>`;
   document.querySelectorAll('#games tr.click').forEach((tr) => tr.onclick = () => openGame(tr.dataset.id));
   document.querySelectorAll('#games [data-power]').forEach((b) => b.onclick = async (e) => {
     e.stopPropagation();
@@ -241,15 +241,39 @@ $('#newGame').onclick = async () => {
 };
 
 // ---------- game detail ----------
-function openGame(id) { $('#playersPanel').classList.add('hidden'); current = id; detailTab = 'rooms'; paused = false; $('#overview').classList.add('hidden'); $('#detail').classList.remove('hidden'); $('#detail').innerHTML = '<div class="empty">Loading…</div>'; tick(); }
+function openGame(id) { $('#playersPanel').classList.add('hidden'); current = id; detailTab = 'setup'; paused = false; $('#overview').classList.add('hidden'); $('#detail').classList.remove('hidden'); $('#detail').innerHTML = '<div class="empty">Loading…</div>'; tick(); }
 function closeGame() { $('#playersPanel').classList.remove('hidden'); current = null; $('#detail').classList.add('hidden'); $('#overview').classList.remove('hidden'); tick(); }
 
 function claudePrompt(g) {
-  return `Add online multiplayer to this game using my multiplayer server.
+  const open = !g.settings.setupDisabled;
+  const head = `Add online multiplayer to this game using my multiplayer server${open ? ', and configure the server for it' : ''}.
+
 Server URL: ${SERVER}
-Game key: ${g.key}
-SDK: <script src="${SERVER}/sdk.js"><\/script>  (global \`Multiplayer\`)
-Full integration guide: ${SERVER}/MULTIPLAYER.md — fetch and follow it (or use the MULTIPLAYER.md I attached).`;
+Game key (public, goes in the game code): ${g.key}
+${open ? `Setup key (SECRET: only for the setup API calls below; never put it in game code or commit it): ${g.settings.setupKey}\n` : ''}SDK: <script src="${SERVER}/sdk.js"><\/script>  (global \`Multiplayer\`)
+Integration guide: ${SERVER}/MULTIPLAYER.md (fetch and follow it${open ? ', including §0 "Setup API"' : ''})`;
+  if (!open) {
+    const cfg = { profile: g.settings.profile || null, roomTypes: g.settings.roomTypes || {}, requireRoomType: !!g.settings.requireRoomType,
+      limits: g.settings.limits || {}, servers: (g.servers || []).map((x) => ({ id: x.id, name: x.name, region: x.region, maxPlayers: x.maxPlayers, type: x.type })),
+      storage: { playerDataWrite: g.settings.playerDataWrite || 'all', gameDataWrite: g.settings.gameDataWrite || 'all' } };
+    return head + `
+
+The server is already configured for this game: setup is finished and the setup API is closed, so don't try to change server settings. Build against this configuration:
+${JSON.stringify(cfg, null, 2)}
+
+Integrate the SDK following MULTIPLAYER.md using these room types and servers. If a server setting should change, tell me what and why; I'll change it in the dashboard.`;
+  }
+  return head + `
+
+Do this in order (send every setup call with header "Authorization: Bearer <setup key>"):
+1. Read the game's code and work out what it needs: genre, session type (match / lobby / persistent / open-world), average and peak concurrent players, players per room, whether players move (2d/3d) and their position fields, world size or view distance, how often each client should send updates (sendRate, Hz), server tick rate if rules run on the server, the round-trip latency it feels good at (latencyTarget, ms), whether cheating matters, regions, and the data it syncs (player data, room state, storage, messages).
+2. POST ${SERVER}/api/setup/messages {"text": "..."} to tell me in the dashboard what you found and what you plan. Use this chat throughout: for real questions, post the question, then GET ${SERVER}/api/setup/messages?after=<last id>&wait=60 (repeat) until I reply. Don't block on questions you can answer sensibly yourself.
+3. GET ${SERVER}/api/setup to see the current setup, the schema and live metrics.
+4. POST ${SERVER}/api/setup/recommend with {"profile": {...}}. Review the recommended setup, estimates and notes, and adjust anything that doesn't fit this game (room types, max players, interest radius, servers, leaderboards, storage rules, remote config, server script).
+5. PUT ${SERVER}/api/setup?dryRun=1 with the final setup document; fix errors and warnings; then PUT ${SERVER}/api/setup to apply it. Keep the profile accurate: the dashboard compares it against measured player counts, update rates and ping.
+6. Integrate the SDK in the game following MULTIPLAYER.md, using the room types / servers you configured. Test it.
+7. When everything works, POST ${SERVER}/api/setup/done {"summary": "what you configured and why"}. This closes the setup API for good; after that only I can change game settings, in the dashboard. Don't call it before you're finished.
+8. Tell me what you chose and why, and anything I should check in the dashboard.`;
 }
 
 let openRooms = new Set(), kvCache = null;
@@ -284,7 +308,7 @@ async function renderDetail() {
   document.querySelectorAll('#detail details[open]').forEach((d) => openRooms.add(d.dataset.room));
   document.querySelectorAll('#detail details:not([open])').forEach((d) => openRooms.delete(d.dataset.room));
   const origins = (g.settings.allowedOrigins || []).join(', ');
-  const tabs = ['rooms', 'servers', 'players', 'server logic', 'leaderboards', 'storage', 'settings'];
+  const tabs = ['setup', 'rooms', 'servers', 'players', 'server logic', 'leaderboards', 'storage', 'settings'];
   const rules = { limits: g.settings.limits || {}, roomTypes: g.settings.roomTypes || {}, roomDefaults: g.settings.roomDefaults || {}, requireRoomType: !!g.settings.requireRoomType };
   let body = '';
   if (detailTab === 'rooms') body = g.rooms.length ? g.rooms.map((r) => `<details class="room" data-room="${esc(r.id)}" ${openRooms.has(r.id) ? 'open' : ''}>
@@ -307,6 +331,50 @@ async function renderDetail() {
   if (detailTab === 'leaderboards') body = g.leaderboards.length ? g.leaderboards.map((b) => `<div class="row" style="padding:8px 0;border-bottom:1px solid var(--line)">
       <b class="mono">${esc(b.board)}</b><span class="tag">${num(b.entries)} entries</span>${b.config ? `<span class="tag">${esc(b.config.mode)} · ${esc(b.config.sort)}</span><span class="tag">${esc(b.config.periods.join(' / '))}</span>${b.config.clientWrite ? '' : '<span class="tag">server-only</span>'}` : ''}<span class="mute">${ago(b.updated)}</span><span class="sp"></span>
       <button class="sm" data-lbview="${esc(b.board)}">View</button><button class="sm danger" data-lbdel="${esc(b.board)}">Reset</button></div>`).join('') + '<pre id="lbOut" class="hidden"></pre>' : '<div class="empty">No leaderboards yet</div>';
+  if (detailTab === 'setup') {
+    const v = await api('GET', `/games/${g.id}/setup`), p = v.profile, m = v.metrics, e = v.estimates;
+    const val = (x, unit = '') => (x == null || x === '' ? '<span class="mute">—</span>' : `${typeof x === 'number' ? num(x) : esc(x)}${unit}`);
+    const pl = (p && p.players) || {};
+    const pingTag = p && p.latencyTarget && m.avgPing != null ? (m.avgPing <= p.latencyTarget ? ' <span class="tag ok">on target</span>' : ' <span class="tag bad">over target</span>') : '';
+    const vs = (meas, exp) => (meas != null && exp ? ` <span class="mute">(${Math.round((meas / exp) * 100)}% of expected)</span>` : '');
+    const rows = [
+      ['Players online (average)', val(pl.average), `${val(m.avg1h)} last hour · ${val(m.avg24h)} last 24 h · ${num(m.online)} now${vs(m.avg24h ?? m.avg1h, pl.average)}`],
+      ['Peak players', val(pl.peak), `${val(m.peak24h)} last 24 h${vs(m.peak24h, pl.peak)}`],
+      ['Players per room', val(pl.perRoom), `${val(m.avgRoomSize)} average · ${val(m.largestRoom)} largest · ${num(m.rooms)} rooms`],
+      ['Player update rate', p && p.sendRate ? val(p.sendRate, ' Hz per player') : val(null), `${val(m.msgsPerPlayer, ' msgs/s per player')} · ${val(m.msgsPerSecond, ' msgs/s total')}`],
+      ['Server tick', p && p.tickRate ? val(p.tickRate, ' Hz') : val(null), v.script.loaded ? `${val(v.script.tickRate || 0, ' Hz')} (server script loaded)` : '<span class="mute">no server script</span>'],
+      ['Round-trip latency', p && p.latencyTarget ? val(p.latencyTarget, ' ms target') : val(null), `${ping(m.avgPing)} average${pingTag}`],
+      ['Traffic at peak', e ? `${num(e.serverSendsPerSecondAtPeak)} sends/s · ${e.playersSeenPerClient} players seen each · ${e.downloadPerClientKBs} KB/s per player` : val(null), e ? esc(e.capacity) : ''],
+    ];
+    const types = Object.entries(v.setup.roomTypes || {});
+    body = `<div class="nore">
+      <div class="kv" style="margin-bottom:14px">
+        <span class="mute">Setup</span><div class="row">${{ waiting: '<span class="tag">waiting for agent</span>', in_progress: '<span class="tag acc">agent working</span>', done: '<span class="tag ok">done</span>' }[v.status]}
+          <span class="mute">${v.status === 'done' ? `finished ${ago(v.setupCompleted)}: the setup API is closed, so game settings only change here in the dashboard` : v.setupApplied ? `last applied ${ago(v.setupApplied)}` : 'hand Claude the integration prompt above: it describes the game and configures the server through the setup API'}</span>
+          <span class="sp"></span>${v.status === 'done' ? '<button class="sm" id="skReopen">Re-open setup</button>' : ''}</div>
+        <span class="mute">Setup key</span><div class="row">${v.status === 'done' ? '<span class="mute">closed (re-open setup to issue a new key)</span>' : `<div class="secret mono" style="flex:1">${esc(g.settings.setupKey || '')}</div><button class="sm" data-copy="${esc(g.settings.setupKey || '')}">Copy</button><button class="sm danger" id="skRotate">Rotate</button>`}</div>
+        ${p ? `<span class="mute">Game</span><div><b>${esc(p.genre || 'untitled')}</b> <span class="tag">${esc(p.sessionType)}</span>${p.movement !== 'none' ? `<span class="tag">${esc(p.movement)} movement</span>` : ''}${p.competitive ? '<span class="tag">competitive</span>' : ''}${(p.regions || []).map((r) => `<span class="tag">${esc(r)}</span>`).join('')}${p.description ? `<div class="mute" style="margin-top:4px">${esc(p.description)}</div>` : ''}</div>` : ''}
+      </div>
+      <div class="mute" style="margin-bottom:6px">Setup chat${v.status === 'done' ? ' (closed)' : ': the agent explains its choices and asks you questions here'}</div>
+      <div id="setupChat" style="max-height:280px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:8px">
+        ${v.chat.map((x) => `<div style="margin:6px 0"><span class="tag ${x.sender === 'agent' ? 'acc' : ''}">${x.sender === 'agent' ? 'Claude' : 'You'}</span> <span class="mute">${new Date(x.created).toLocaleTimeString()}</span><div style="white-space:pre-wrap;margin-top:2px">${esc(x.text)}</div></div>`).join('') || '<div class="empty">No messages yet</div>'}
+      </div>
+      ${v.status === 'done' ? '' : `<div class="row" style="margin-bottom:16px"><input id="chatText" placeholder="Reply to the agent…" style="flex:1"><button class="sm primary" id="chatSend">Send</button></div>`}
+      <div class="tablewrap"><table><thead><tr><th></th><th>Expected (from setup)</th><th>Measured</th></tr></thead><tbody>
+        ${rows.map(([k, x, y]) => `<tr><td><b>${k}</b></td><td>${x}</td><td>${y}</td></tr>`).join('')}
+      </tbody></table></div>
+      <div class="mute" style="margin:6px 0 14px">Averages are sampled every minute and kept for 24 h (they restart with the server).</div>
+      ${v.warnings.length ? `<div style="margin-bottom:14px">${v.warnings.map((w) => `<div><span class="tag bad">check</span> ${esc(w)}</div>`).join('')}</div>` : ''}
+      <div class="mute" style="margin-bottom:6px">Room types</div>
+      <div class="tablewrap"><table><thead><tr><th>Type</th><th>Max players</th><th>Interest radius</th><th>State writes</th><th>Other</th></tr></thead><tbody>
+        ${types.map(([k, t]) => `<tr><td class="mono">${esc(k)}</td><td>${val(t.maxPlayers)}</td><td>${t.aoi ? `${num(t.aoi.radius)} <span class="mute">(${esc((t.aoi.keys || ['x', 'y']).join(','))})</span>` : '<span class="mute">off</span>'}</td><td>${esc(t.stateWrite || 'all')}</td><td class="mute">${[t.persist ? 'persist' : '', t.private ? 'private' : '', t.clientOptions === false ? 'locked options' : ''].filter(Boolean).join(' · ')}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">No room types</td></tr>'}
+      </tbody></table></div>
+      <div class="mute" style="margin:14px 0 6px">Limits · ${v.servers.length} public server(s) · ${v.leaderboards.length} leaderboard(s) · storage writes: player ${esc(v.setup.storage.playerDataWrite)}, game ${esc(v.setup.storage.gameDataWrite)}</div>
+      <pre>${esc(JSON.stringify(v.setup.limits || {}, null, 2))}</pre>
+      ${p && p.dataModel ? `<div class="mute" style="margin:14px 0 6px">Data model</div><pre>${esc(JSON.stringify(p.dataModel, null, 2))}</pre>` : ''}
+      ${p && p.notes ? `<div class="mute" style="margin:14px 0 6px">Notes</div><div>${esc(p.notes)}</div>` : ''}
+    </div>`;
+  }
   if (detailTab === 'servers') body = `<div class="nore">
       ${g.servers.length ? g.servers.map((x) => `<div class="row" style="padding:8px 0;border-bottom:1px solid var(--line)">
         <b>${esc(x.name)}</b><span class="mono mute">${esc(x.id)}</span><span class="tag acc">${x.players}/${x.maxPlayers}</span>${x.queue ? `<span class="tag">${x.queue} queued</span>` : ''}
@@ -388,6 +456,22 @@ async function renderDetail() {
     };
     $('#scRemove').onclick = async () => { if (!confirm('Remove the server script? Rooms fall back to client/host logic.')) return; show(await api('DELETE', `/games/${g.id}/script`)); $('#scCode').value = ''; toast('Removed'); };
     $('#scExample').onclick = () => { $('#scCode').value = SCRIPT_EXAMPLE; };
+  }
+  if (detailTab === 'setup') {
+    const box = $('#setupChat'); box.scrollTop = box.scrollHeight;
+    if ($('#chatSend')) {
+      const sendReply = async () => { const t = $('#chatText').value.trim(); if (!t) return; await api('POST', `/games/${g.id}/setup/messages`, { text: t }); $('#chatText').value = ''; $('#chatText').blur(); tick(true); };
+      $('#chatSend').onclick = sendReply;
+      $('#chatText').onkeydown = (e) => { if (e.key === 'Enter') sendReply(); };
+    }
+    if ($('#skReopen')) $('#skReopen').onclick = async () => {
+      if (!confirm('Re-open setup? A new setup key is issued and an agent can change game settings again until it sends done.')) return;
+      await api('POST', `/games/${g.id}/setup/reopen`); toast('Setup re-opened: copy the new prompt'); tick(true);
+    };
+    if ($('#skRotate')) $('#skRotate').onclick = async () => {
+      if (!confirm('Rotate the setup key? Agents using the old key lose access.')) return;
+      await api('PATCH', '/games/' + g.id, { rotateSetupKey: true }); toast('Setup key rotated'); tick(true);
+    };
   }
   if (detailTab === 'servers') {
     let editing = null;
