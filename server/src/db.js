@@ -35,6 +35,10 @@ export function openDb(dir) {
       id INTEGER PRIMARY KEY AUTOINCREMENT, game TEXT NOT NULL, player TEXT NOT NULL, sender TEXT NOT NULL,
       sender_name TEXT, type TEXT NOT NULL, data TEXT NOT NULL, created INTEGER NOT NULL, read INTEGER NOT NULL DEFAULT 0);
     CREATE INDEX IF NOT EXISTS inbox_player ON inbox (game, player, id);
+    CREATE TABLE IF NOT EXISTS setup_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, game TEXT NOT NULL, sender TEXT NOT NULL, -- agent | admin
+      text TEXT NOT NULL, created INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS setup_messages_game ON setup_messages (game, id);
     CREATE TABLE IF NOT EXISTS servers (
       game TEXT NOT NULL, id TEXT NOT NULL, config TEXT NOT NULL, created INTEGER NOT NULL, PRIMARY KEY (game, id));
   `);
@@ -90,7 +94,7 @@ export function openDb(dir) {
   };
 
   const purgeGame = (id) => {
-    for (const t of ['kv', 'accounts', 'scores', 'players', 'boards', 'friends', 'inbox', 'servers']) db.prepare(`DELETE FROM ${t} WHERE game = ?`).run(id);
+    for (const t of ['kv', 'accounts', 'scores', 'players', 'boards', 'friends', 'inbox', 'servers', 'setup_messages']) db.prepare(`DELETE FROM ${t} WHERE game = ?`).run(id);
     S.gameDelete.run(id);
   };
 

@@ -3,6 +3,7 @@
 A self-hosted, game-agnostic multiplayer backend. One Docker stack on your VPS gives you:
 
 - **Public servers and open worlds**: a server browser of permanent, admin-defined servers (name, region, tags, MOTD, password, whitelist, join queue, saved state), rooms of up to 5000 players, and interest management so each player only receives the players near them (1000 players in one room measured with a 0 ms median ping).
+- **Setup API for coding agents**: each game has a secret setup key. The dashboard's integration prompt tells Claude to work out the game's needs, call `POST /api/setup/recommend` with a profile (players, update rate, latency target, data model) and apply the result with `PUT /api/setup`: room types, limits, servers, leaderboards, storage rules and the server script. The game's **Setup** tab then shows the expected numbers next to the measured ones (average and peak players, players per room, update rate, tick, ping, traffic).
 - **Customisable per game**: limits (room size, room count, rate limits, reconnect grace), named room types that clients can't override, room defaults, and anything else via server scripts. All of it is edited in the dashboard.
 - **Realtime rooms**: share codes, matchmaking (`quickJoin`), host election and migration, kick/ban, locking, passwords, reconnects that keep the player's slot.
 - **Three sync channels**: ordered shared room state, per-player data, and relay messages (to everyone, the host, or specific players, plus DMs).
@@ -104,7 +105,7 @@ Push the repo, then go to **Settings → Pages → Deploy from branch → `main`
 
 ```bash
 cd server && npm install && npm start     # http://localhost:8080, admin token printed on first run
-npm test                                  # end-to-end smoke test (97 checks: rooms, public servers, open-world interest management, room types, storage, leaderboards, social, inbox, matchmaking, chat, UDP/WebRTC, packet loss, failover)
+npm test                                  # end-to-end smoke test (106 checks: rooms, setup API, public servers, open-world interest management, room types, storage, leaderboards, social, inbox, matchmaking, chat, UDP/WebRTC, packet loss, failover)
 ```
 
 ## Configuration (`.env`)
@@ -128,8 +129,14 @@ npm test                                  # end-to-end smoke test (97 checks: ro
 | `MAX_ROOM_PLAYERS` / `HARD_MAX_ROOM_PLAYERS` | `1000` / `5000` | Default room-size cap / the most any game may raise it to |
 | `MAX_ROOMS_PER_GAME` | `10000` | Open rooms per game (games can lower it) |
 
+## Setup API (per game, for coding agents)
+
+`Authorization: Bearer SETUP_KEY` (dashboard → game → Setup). The key only reaches that game's configuration, never other games, players or the admin API. `GET /api/setup` · `POST /api/setup/recommend` (`{profile}`) · `PUT /api/setup` (`?dryRun=1`) · `GET|POST /api/setup/messages` (the setup chat with the dashboard; `?wait=60` long-polls for your reply) · `POST /api/setup/done` (`{summary}`: closes the setup API, after which settings change only in the dashboard). See MULTIPLAYER.md §0. Rotate the key in the dashboard to revoke it; **Re-open setup** issues a new key after done.
+
+Admin equivalents: `GET|PUT /api/admin/games/:id/setup`, `GET|POST /api/admin/games/:id/setup/messages` (your replies), `POST /api/admin/games/:id/setup/reopen`.
+
 ## Admin REST API
 
 All routes take `Authorization: Bearer ADMIN_TOKEN`.
 
-`GET /api/admin/overview` (includes online players) · `POST /api/admin/games/:id/players/:pid/kick` (`{ban, reason}`) · `POST /api/admin/games/:id/players/:pid/unban` · `GET /api/admin/games/:id/leaderboards` · `GET|DELETE /api/admin/games/:id/leaderboards/:board` (`?period=day&previous=1`; DELETE resets every period, `?config=delete` also drops the config) · `GET|PUT /api/admin/games/:id/leaderboards/:board/config` (`{mode, sort, periods, clientWrite, min, max}`) · `POST /api/admin/games/:id/leaderboards/:board/submit` (`{player, score, meta}`) · `DELETE /api/admin/games/:id/leaderboards/:board/players/:pid` · `GET|POST /api/admin/games/:id/servers` · `GET|PATCH|DELETE /api/admin/games/:id/servers/:sid` (`{name, description, region, tags, maxPlayers, password, visibility, whitelist, queue, motd, type, options, enabled}`) · `POST /api/admin/games/:id/inbox` (`{to: id | [ids], type, data}`) · `GET|POST /api/admin/games` · `GET|PATCH|DELETE /api/admin/games/:id` (PATCH accepts `{name, enabled, rotateKey, settings:{allowedOrigins, gameDataWrite, playerDataWrite, lockLeaderboards, inboxClientSend, config, limits, roomTypes, roomDefaults, requireRoomType}}`; changing `config` pushes it to every connected client) · `POST /api/admin/games/:id/rooms/:room/close|kick|state` · `POST /api/admin/games/:id/broadcast` · `GET|PUT|DELETE /api/admin/games/:id/kv` · `GET|DELETE /api/admin/games/:id/leaderboards/:board`
+`GET /api/admin/overview` (includes online players) · `POST /api/admin/games/:id/players/:pid/kick` (`{ban, reason}`) · `POST /api/admin/games/:id/players/:pid/unban` · `GET /api/admin/games/:id/leaderboards` · `GET|DELETE /api/admin/games/:id/leaderboards/:board` (`?period=day&previous=1`; DELETE resets every period, `?config=delete` also drops the config) · `GET|PUT /api/admin/games/:id/leaderboards/:board/config` (`{mode, sort, periods, clientWrite, min, max}`) · `POST /api/admin/games/:id/leaderboards/:board/submit` (`{player, score, meta}`) · `DELETE /api/admin/games/:id/leaderboards/:board/players/:pid` · `GET|PUT /api/admin/games/:id/setup` (`?dryRun=1`) · `POST /api/admin/games/:id/setup/recommend` · `GET|POST /api/admin/games/:id/servers` · `GET|PATCH|DELETE /api/admin/games/:id/servers/:sid` (`{name, description, region, tags, maxPlayers, password, visibility, whitelist, queue, motd, type, options, enabled}`) · `POST /api/admin/games/:id/inbox` (`{to: id | [ids], type, data}`) · `GET|POST /api/admin/games` · `GET|PATCH|DELETE /api/admin/games/:id` (PATCH accepts `{name, enabled, rotateKey, rotateSetupKey, settings:{allowedOrigins, gameDataWrite, playerDataWrite, lockLeaderboards, inboxClientSend, config, limits, roomTypes, roomDefaults, requireRoomType}}`; changing `config` pushes it to every connected client) · `POST /api/admin/games/:id/rooms/:room/close|kick|state` · `POST /api/admin/games/:id/broadcast` · `GET|PUT|DELETE /api/admin/games/:id/kv` · `GET|DELETE /api/admin/games/:id/leaderboards/:board`

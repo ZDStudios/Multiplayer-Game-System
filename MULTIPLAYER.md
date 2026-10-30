@@ -11,6 +11,70 @@ You are adding online multiplayer to a game using a **self-hosted, general-purpo
 
 If you don't have both values, **ask the user for them**. Don't invent them. Keep them in one config constant at the top of the game, like `const MP = { url: '...', key: '...' }`.
 
+### Setup API: configure the server for this game
+If the user gave you a **setup key** (`sk_...`), configure the server side yourself before integrating. The setup key is a secret that controls this one game's configuration. Use it only in your own HTTP calls (curl, a script); **never put it in game code** or commit it. Without a setup key, skip this and ask the user to apply settings in the dashboard.
+
+All calls take `Authorization: Bearer SETUP_KEY` and JSON bodies:
+
+| Call | What it does |
+|---|---|
+| `GET SERVER_URL/api/setup` | Current setup, `profile`, servers, leaderboards, script status, live `metrics` and the `schema` of every field. |
+| `POST SERVER_URL/api/setup/recommend` `{profile}` | Returns `{setup, estimates, notes}`: a complete setup document sized for the profile. |
+| `PUT SERVER_URL/api/setup?dryRun=1` `{...setup}` | Validates only and returns `{applied, warnings}`. |
+| `PUT SERVER_URL/api/setup` `{...setup}` | Applies it. Every field is optional; omitted fields stay as they are. If anything is invalid, nothing is applied (HTTP 400 with the field in `message`). |
+| `POST SERVER_URL/api/setup/messages` `{text}` | Posts to the **setup chat** in the user's dashboard. Use it for what you found, what you plan, and real questions. |
+| `GET SERVER_URL/api/setup/messages?after=ID&wait=60` | Reads the chat after message `ID`. `wait` (seconds, max 60) holds the request open until the user replies. Returns `{status, messages: [{id, sender: 'agent'\|'admin', text, created}]}`. |
+| `POST SERVER_URL/api/setup/done` `{summary}` | **Finishes setup.** Posts the summary and closes the setup API for good: every later call gets HTTP 403 `setup_closed`, and game settings can only be changed in the dashboard. The user can re-open setup there with a new key. Call it only when the game is integrated and working. |
+
+**1. Describe the game (`profile`).** Work it out from the game's code and design. The dashboard shows it next to the measured numbers, so keep it realistic.
+```jsonc
+{ "profile": {
+  "genre": "top-down survival", "description": "Up to 200 players share a 4 km map, build bases, fight.",
+  "sessionType": "open-world",            // match | lobby | persistent | open-world
+  "players": { "average": 120, "peak": 400, "perRoom": 200 },   // concurrent online, busiest moment, per room/world
+  "movement": "2d", "positionKeys": ["x", "y"], "worldSize": 4000, "viewDistance": 600,
+  "sendRate": 20,                          // Hz each client sends player data while moving
+  "tickRate": 10,                          // Hz server-script onTick (0 = none)
+  "latencyTarget": 100,                    // ms round trip that feels good
+  "competitive": true, "regions": ["au"],
+  "dataModel": { "player": { "x": "number", "y": "number", "hp": "number" }, "state": { "buildings": "map" }, "storage": { "inventory": "private" } }
+} }
+```
+**2. Get a recommendation.** `POST /api/setup/recommend` sizes everything from the profile:
+- interest management (`aoi`) and its radius
+- room types and their max players
+- limits (rate limit, reconnect grace)
+- public servers per region for the peak
+- anti-cheat storage rules
+
+Its `estimates` give traffic per player and server load, and its `notes` explain each choice.
+
+**3. Adjust and apply.** Edit what doesn't fit, dry-run, then `PUT`. A full setup document:
+```json
+{
+  "profile": { "...": "as above" },
+  "limits": { "maxRoomPlayers": 200, "defaultMaxPlayers": 200, "rateLimit": 70, "rateBurst": 210, "reconnectGraceMs": 60000 },
+  "roomTypes": { "world": { "maxPlayers": 200, "aoi": { "radius": 600, "keys": ["x", "y"] }, "persist": true } },
+  "requireRoomType": true,
+  "servers": [ { "id": "au-1", "name": "AU #1", "region": "au", "maxPlayers": 200, "type": "world", "queue": true } ],
+  "replaceServers": false,
+  "storage": { "playerDataWrite": "none", "gameDataWrite": "none" },
+  "leaderboards": { "kills_weekly": { "mode": "sum", "periods": ["week"], "clientWrite": false } },
+  "lockLeaderboards": true,
+  "config": { "motd": "Welcome!", "dayLengthSec": 1200 },
+  "script": "module.exports = { tickRate: 10, onMessage(room, p, type, data) { /* rules */ } };"
+}
+```
+Rules of thumb (the recommendation applies them for you):
+- Use `aoi` once more than ~32 players share a room and have positions.
+- `rateLimit` should be at least 2 × `sendRate` + 20.
+- Use public servers for persistent worlds and room types + `quickJoin` / matchmaking for matches.
+- With `competitive: true`, set `playerDataWrite: 'none'` and use `clientWrite: false` boards, and put the rules in the server script.
+
+Then integrate the SDK using the room types and servers you configured, e.g. `mp.joinServer('au-1')` or `mp.quickJoin('ranked', { type: 'match' })`.
+
+**4. Talk to the user, then finish.** Post short progress notes and decisions to the setup chat as you go. When you need a decision you can't make sensibly yourself, post the question and poll `GET /api/setup/messages?after=<your message id>&wait=60` until a message with `sender: 'admin'` arrives. When the game is integrated and tested, call `POST /api/setup/done` with a summary of what you configured and why. That locks the configuration: after it, the server's settings belong to the user and the dashboard.
+
 ## 1. Load the SDK
 
 **Browser (any framework):**
