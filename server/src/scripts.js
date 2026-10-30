@@ -98,6 +98,12 @@ export function createScripting(h) {
       get players() { return [...room.players.values()].map(pubPlayer); },
       data: {},                                    // server-only scratch space (never sent to clients)
       player: (id) => { const m = room.players.get(id); return m ? pubPlayer(m) : null; },
+      // Players that can see `id` (its area of interest), or everyone else in a room without interest management.
+      nearby: (id) => {
+        const m = room.players.get(String(id));
+        if (!m) return [];
+        return (room.aoi ? [...h.aoi.watchers(room, m)] : [...room.players.values()].filter((o) => o !== m)).map(pubPlayer);
+      },
       getState: (p) => p.split('.').reduce((o, k) => (o == null ? o : o[k]), room.state),
       setState: (p, v) => op(p, v, v === undefined),
       deleteState: (p) => op(p, null, true),

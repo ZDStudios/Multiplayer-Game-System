@@ -187,7 +187,7 @@ export function createServices(d) {
   };
   const numOr = (v) => (v == null || v === '' || !Number.isFinite(+v) ? null : +v);
   function normBoard(o = {}) {
-    const mode = ['max', 'min', 'sum', 'last'].includes(o.mode) ? o.mode : 'max';
+    const mode = o.mode === 'set' ? 'last' : ['max', 'min', 'sum', 'last'].includes(o.mode) ? o.mode : 'max'; // 'set' = old name of 'last'
     return {
       mode,                                                    // how a new score combines with the stored one
       sort: o.sort === 'asc' || o.sort === 'desc' ? o.sort : mode === 'min' ? 'asc' : 'desc',
@@ -200,7 +200,8 @@ export function createServices(d) {
     if (typeof id !== 'string' || !BOARD_RE.test(id)) throw new E('bad_board', 'Board ids: 1-64 chars of A-Z a-z 0-9 _ - . :');
     const r = B.get.get(gid, id);
     if (r) return JSON.parse(r.config);
-    if (!create && !B.count.get(gid, id).n) return null; // boards from before configs existed get the defaults
+    // Boards from before configs existed: read with the defaults, but let the first submit's mode decide the config.
+    if (!create) return B.count.get(gid, id).n ? normBoard({}) : null;
     const cfg = normBoard(hint);
     B.put.run(gid, id, JSON.stringify(cfg), now());
     return cfg;
@@ -218,6 +219,8 @@ export function createServices(d) {
   const entry = (r, rank) => ({ rank, id: r.id, name: r.name, score: r.score, meta: r.meta ? JSON.parse(r.meta) : null, updated: r.updated });
   const rankOf = (gid, b, cfg, score, updated) => (cfg.sort === 'asc' ? B.betterAsc : B.betterDesc).get(gid, b, score, score, updated).n + 1;
   function needBoard(gid, id) { const cfg = boardCfg(gid, id, false); if (!cfg) throw new E('board_not_found'); return cfg; }
+  // Older clients pass order: 'asc' | 'desc' per call; it still overrides the board's sort for that read.
+  const view = (cfg, o) => (o.order === 'asc' || o.order === 'desc' ? { ...cfg, sort: o.order } : cfg);
   function pickPeriod(cfg, p) { p = p || 'all'; if (!cfg.periods.includes(p)) throw new E('bad_period', `This board keeps: ${cfg.periods.join(', ')}`); return p; }
 
   function lbSubmit(gid, board, pid, name, score, meta, o = {}) {
@@ -242,7 +245,7 @@ export function createServices(d) {
     return { board, ...periods.all, periods };
   }
   function lbTop(gid, board, o = {}) {
-    const cfg = needBoard(gid, board), p = pickPeriod(cfg, o.period), b = rowBoard(board, p, o.previous ? 1 : 0);
+    const cfg = view(needBoard(gid, board), o), p = pickPeriod(cfg, o.period), b = rowBoard(board, p, o.previous ? 1 : 0);
     const limit = clamp(o.limit, 1, 100, 10), offset = clamp(o.offset, 0, 1e7, 0);
     const entries = (cfg.sort === 'asc' ? B.topAsc : B.topDesc).all(gid, b, limit, offset).map((r, i) => entry(r, offset + i + 1));
     return { board, period: p, previous: !!o.previous, entries, total: B.count.get(gid, b).n, resetsAt: o.previous ? null : resetsAt(p) };
@@ -252,7 +255,7 @@ export function createServices(d) {
     return r ? entry({ id: pid, name: (nameOf.get(gid, pid) || {}).name, ...r }, rankOf(gid, b, cfg, r.score, r.updated)) : null;
   }
   function lbAround(gid, board, pid, o = {}) {
-    const cfg = needBoard(gid, board), p = pickPeriod(cfg, o.period), b = rowBoard(board, p, o.previous ? 1 : 0);
+    const cfg = view(needBoard(gid, board), o), p = pickPeriod(cfg, o.period), b = rowBoard(board, p, o.previous ? 1 : 0);
     const me = lbEntry(gid, board, cfg, b, pid);
     if (!me) return { board, period: p, entries: [], me: null };
     const range = clamp(o.range, 1, 50, 5), offset = Math.max(0, me.rank - 1 - range);
@@ -260,7 +263,7 @@ export function createServices(d) {
     return { board, period: p, entries, me };
   }
   function lbPlayers(gid, board, list, o = {}) {
-    const cfg = needBoard(gid, board), p = pickPeriod(cfg, o.period), b = rowBoard(board, p, o.previous ? 1 : 0);
+    const cfg = view(needBoard(gid, board), o), p = pickPeriod(cfg, o.period), b = rowBoard(board, p, o.previous ? 1 : 0);
     const entries = list.map((pid) => lbEntry(gid, board, cfg, b, pid)).filter(Boolean).sort((x, y) => x.rank - y.rank);
     return { board, period: p, entries };
   }
@@ -462,7 +465,7 @@ export function createServices(d) {
     },
     'lb.top'(c, m) {
       const r = lbTop(c.game.id, m.board, m);
-      const cfg = needBoard(c.game.id, m.board);
+      const cfg = view(needBoard(c.game.id, m.board), m);
       return { ...r, me: lbEntry(c.game.id, m.board, cfg, rowBoard(m.board, r.period, m.previous ? 1 : 0), c.pid) };
     },
     'lb.around'(c, m) { return lbAround(c.game.id, m.board, m.player != null ? String(m.player) : c.pid, m); },
