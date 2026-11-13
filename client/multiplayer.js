@@ -117,6 +117,7 @@
     }
   }
 
+  const VERSION = '2026.11'; // sent in hello; the dashboard shows which SDK each player runs
   const TRANSPORTS = ['webrtc', 'udp', 'websocket'];
   // How much worse (ms) a link must score before we leave it: avoids flapping between near-equal links.
   const SWITCH_MARGIN = 2;
@@ -291,7 +292,7 @@
         });
         ws.onopen = () => {
           this._tickTimer = setInterval(() => this._sess.tick(Date.now()), 25);
-          this._sess.send(JSON.stringify({ t: 'hello', v: 2, key: this.key, token: this._store.getItem(this._tokenKey) || undefined, name: this.name || undefined }));
+          this._sess.send(JSON.stringify({ t: 'hello', v: 2, sdk: VERSION, key: this.key, token: this._store.getItem(this._tokenKey) || undefined, name: this.name || undefined }));
           // Pipeline: send the (re)join right behind hello instead of waiting for welcome.
           const j = this.room && this._retry > 0 ? ['join', { room: this.room.id, options: this._lastJoinOpts || {} }] : this._autoJoin;
           this._autoJoin = null;
@@ -828,6 +829,7 @@
   }
 
   Multiplayer.MultiplayerError = MultiplayerError;
+  Multiplayer.VERSION = VERSION;
   Multiplayer.Session = Session; // the server uses the same session layer
   Multiplayer.default = Multiplayer;
   return Multiplayer;

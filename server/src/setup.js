@@ -215,6 +215,8 @@ export function createSetup(d) {
       report.warnings = warningsFor({ settings: { ...g.settings, ...v.settings } }, v);
       return report;
     }
+    // The script goes first: if it fails to load, the old one stays and nothing else is changed.
+    if (v.script !== undefined) { report.script = setScript(g, v.script); report.applied.push('script'); }
     if (v.profile) { g.settings.profile = { ...v.profile, updated: Date.now() }; report.applied.push('profile'); }
     if (Object.keys(v.settings).length) {
       const hadConfig = 'config' in v.settings;
@@ -232,7 +234,6 @@ export function createSetup(d) {
       }
       if (v.replaceServers) for (const id of existing) if (!v.servers.some((s) => s.id === id)) { servers.admin(g, 'DELETE', id, {}); report.servers.deleted.push(id); }
     }
-    if (v.script !== undefined) { report.script = setScript(g, v.script); report.applied.push('script'); }
     g.settings.setupApplied = Date.now(); saveGame(g);
     report.warnings = warningsFor(g, v);
     log(g.id, 'setup', `Setup applied: ${report.applied.concat(v.servers ? ['servers'] : [], v.leaderboards ? ['leaderboards'] : []).join(', ')}`);

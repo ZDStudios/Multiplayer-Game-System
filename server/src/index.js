@@ -49,6 +49,15 @@ const CFG = {
 const store = openDb(CFG.dataDir);
 const { S } = store;
 const rid = (n = 9) => crypto.randomBytes(n).toString('base64url');
+// Uniform random [A-Za-z0-9] string (rejection sampling: bytes >= 248 are skipped so every char is equally likely).
+const B62 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+function randomString(n = 32) {
+  let s = '';
+  while (s.length < n) for (const b of crypto.randomBytes(n * 2)) { if (b < 248) s += B62[b % 62]; if (s.length === n) break; }
+  return s;
+}
+const newGameKey = () => 'pk_' + randomString(32);  // public game key: 32 random chars after the prefix
+const newSetupKey = () => 'sk_' + randomString(32); // secret setup key
 const metaOr = (k, make) => {
   const row = S.metaGet.get(k);
   if (row) return row.v;
@@ -59,7 +68,7 @@ const metaOr = (k, make) => {
 const SECRET = env.TOKEN_SECRET || metaOr('secret', () => rid(32));
 let ADMIN_TOKEN = env.ADMIN_TOKEN;
 if (!ADMIN_TOKEN || ADMIN_TOKEN.length < 16) {
-  ADMIN_TOKEN = metaOr('admin_token', () => 'adm_' + rid(24));
+  ADMIN_TOKEN = metaOr('admin_token', () => 'adm_' + randomString(40));
   console.log(`[mp] ADMIN_TOKEN not set (or <16 chars). Using stored token: ${ADMIN_TOKEN}`);
 }
 
@@ -73,14 +82,14 @@ function loadGame(row) {
   games.set(g.id, g);
   gamesByKey.set(g.key, g);
   if (!gameStats.has(g.id)) gameStats.set(g.id, { msgs: 0, rate: 0, peak: 0, lastActive: 0, minutes: [], acc: 0, accN: 0, accMax: 0 });
-  if (!g.settings.setupKey) { g.settings.setupKey = 'sk_' + rid(18); saveGame(g); } // for the setup API (coding agents)
+  if (!g.settings.setupKey) { g.settings.setupKey = newSetupKey(); saveGame(g); } // for the setup API (coding agents)
   return g;
 }
 for (const row of S.gamesAll.all()) loadGame(row);
 
 function createGame(name, settings = {}, key) {
   const id = 'g_' + rid(6);
-  key = key || 'pk_' + rid(18);
+  key = key || newGameKey(); // existing keys (any format) keep working; new ones are 32 random chars
   S.gameInsert.run(id, String(name).slice(0, 64) || 'Untitled', key, JSON.stringify(settings), Date.now());
   log(id, 'game', `Game created: ${name}`);
   return loadGame({ id, name, key, enabled: 1, settings: JSON.stringify(settings), created: Date.now() });
@@ -350,11 +359,11 @@ function joinRoom(c, id, o = {}) {
       return { queued: true, room: id, position: room.waiting.findIndex((w) => w.c === c) + 1 };
     }
   }
-  if (c.room) removeMember(c.room, c.pid, 'left');
   if (!room) {
     if (o.mustExist) throw new E('room_not_found');
-    room = createRoom(c.game, id, o);
+    room = createRoom(c.game, id, o); // may throw (limits, bad options): you then stay in your current room
   }
+  if (c.room && c.room !== room) removeMember(c.room, c.pid, 'left');
   let m = room.players.get(c.pid);
   if (m) { // rejoin during reconnect grace
     clearTimeout(m.graceTimer);
@@ -379,7 +388,7 @@ const services = createServices({ db: store.db, E, online, rkey, send, out, isOb
 const servers = createServers({ db: store.db, E, rooms, rkey, createRoom, destroyRoom, drainQueue, isObj, str, log, games, limits });
 const scripts = createScripting({ log, broadcast, send, setPath, removeMember, pubPlayer, E, services, aoi });
 for (const g of games.values()) if (g.settings.script) scripts.load(g);
-const setup = createSetup({ db: store.db, E, games, saveGame, isObj, str, safeMerge, services, servers, scripts, setScript, metrics, log, rooms, online });
+const setup = createSetup({ db: store.db, E, games, saveGame, isObj, str, safeMerge, services, servers, scripts, setScript: installScript, metrics, log, rooms, online });
 
 function onDisconnect(c) {
   const room = c.room;
@@ -393,6 +402,12 @@ function onDisconnect(c) {
 }
 const needRoom = (c) => { if (!c.room) throw new E('not_in_room'); return c.room; };
 const needHost = (c) => { const r = needRoom(c); if (r.host !== c.pid) throw new E('not_host'); return r; };
+// Host powers (lock, kick, room settings) don't apply on public servers: those are managed in the dashboard.
+const needRoomControl = (c) => {
+  const r = needHost(c);
+  if (r.server && !r.server.hostControls) throw new E('forbidden', 'Public servers are managed by the admin, not by the host');
+  return r;
+};
 function publicRooms(game, tag) {
   const out = [];
   for (const r of rooms.values()) {
@@ -435,7 +450,7 @@ const H = {
   'queue.leave'(c) { return leaveQueue(c); },
 
   'room.update'(c, m) {
-    const r = needHost(c);
+    const r = needRoomControl(c);
     if (m.locked != null) r.locked = !!m.locked;
     if (m.private != null) r.private = !!m.private;
     if (m.maxPlayers != null && !r.server) r.maxPlayers = Math.max(1, Math.min(limits(c.game).maxRoomPlayers, Math.floor(+m.maxPlayers) || r.maxPlayers));
@@ -451,7 +466,7 @@ const H = {
     return roomInfo(r);
   },
   kick(c, m) {
-    const r = needHost(c);
+    const r = needRoomControl(c);
     const id = String(m.id), t = r.players.get(id);
     if (!t || id === c.pid) throw new E('bad_player');
     if (m.ban) r.banned.add(id);
@@ -584,6 +599,7 @@ function hello(c, m) {
   const pid = readToken(game.id, m.token) || 'p_' + rid(8);
   if ((game.settings.banned || []).includes(pid)) return c.ws.close(4005, 'banned');
   claimIdentity(c, pid);
+  c.sdk = typeof m.sdk === 'string' ? m.sdk.slice(0, 32) : c.legacy ? 'v1' : 'v2';
   const row = S.playerGet.get(game.id, pid);
   c.name = cleanName(m.name) || (row && row.name) || 'Player-' + pid.slice(2, 6);
   c.username = (S.accByPlayer.get(game.id, pid) || {}).username || null;
@@ -648,6 +664,14 @@ function json(res, code, body) {
   res.writeHead(code, { 'content-type': 'application/json', 'cache-control': 'no-store' });
   res.end(s);
 }
+function readRaw(req, max = 1 << 20) {
+  return new Promise((resolve, reject) => {
+    let size = 0; const chunks = [];
+    req.on('data', (d) => { size += d.length; if (size > max) { reject(new E('too_large')); req.destroy(); } else chunks.push(d); });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let size = 0; const chunks = [];
@@ -708,8 +732,22 @@ function setupAuth(req, ip) {
   adminFails.set(ip, { n: (f && Date.now() - f.t < 600000 ? f.n : 0) + 1, t: Date.now() });
   return null;
 }
+// Install a script but keep the previous one if the new one fails to load (so a bad upload never breaks the game).
+function installScript(g, code) {
+  const prev = g.settings.script || '';
+  const info = setScript(g, code);
+  if (info.failed) {
+    const err = (info.errors[0] || {}).message || 'load failed';
+    setScript(g, prev);
+    throw new E('bad_script', 'Script failed to load, the previous script is still running: ' + err.split('\n')[0]);
+  }
+  return info;
+}
+const gameEvents = (g, n = 100) => events.filter((e) => e.game === g.id).slice(-n).reverse();
+
 // asAdmin: the dashboard (admin token) — never locked out, and its chat messages come from the user.
-async function setupRoute(g, req, sub, url, asAdmin, res) {
+// arg: the path segment after sub, e.g. /api/setup/storage/<key>.
+async function setupRoute(g, req, sub, url, asAdmin, res, arg) {
   const m = req.method;
   if (!asAdmin) {
     if (g.settings.setupDisabled) throw new E('setup_closed', 'Setup is finished and the setup API is closed. Game settings can only be changed in the dashboard (it can re-open setup).');
@@ -721,8 +759,57 @@ async function setupRoute(g, req, sub, url, asAdmin, res) {
     const wait = asAdmin ? 0 : +url.searchParams.get('wait') || 0;
     return { status: setup.status(g), messages: await setup.read(g, after, wait, (fn) => res.on('close', fn)) };
   }
-  if (asAdmin && sub === 'reopen' && m === 'POST') return setup.reopen(g, 'sk_' + rid(18));
+  if (asAdmin && sub === 'reopen' && m === 'POST') return setup.reopen(g, newSetupKey());
   if (sub === 'done' && m === 'POST') { const b = await readBody(req); return setup.finish(g, b.summary); }
+  // ---- direct uploads: server logic, game data, servers, leaderboards, remote config ----
+  if (sub === 'script') {
+    if (m === 'GET') return { code: g.settings.script || '', ...scripts.info(g.id) };
+    if (m === 'DELETE') return setScript(g, '');
+    if (m === 'PUT' || m === 'POST') { // JSON {code} or the raw file (content-type text/javascript or text/plain)
+      const ct = String(req.headers['content-type'] || '');
+      const code = /json/.test(ct) ? String((await readBody(req)).code ?? '') : await readRaw(req, 512 * 1024);
+      return installScript(g, code);
+    }
+  }
+  if (sub === 'storage') { // game-scope data (shared by everyone): seed items, quests, tuning tables...
+    if (m === 'GET' && arg) { const r = services.storage.get(g.id, 'game', '', arg); if (!r) throw new E('not_found', 'No such key'); return r; }
+    if (m === 'GET') return services.storage.list(g.id, 'game', '', { prefix: url.searchParams.get('prefix') || '', after: url.searchParams.get('after') || '', limit: +url.searchParams.get('limit') || 100 });
+    if (m === 'DELETE' && arg) return services.storage.del(g.id, 'game', '', arg);
+    if ((m === 'PUT' || m === 'POST') && arg) { const b = await readBody(req); return { version: services.storage.put(g.id, 'game', '', arg, b.value, { ttl: b.ttl }) }; }
+    if (m === 'PUT' || m === 'POST') {
+      const b = await readBody(req);
+      if (!isObj(b.entries) || Object.keys(b.entries).length > 1000) throw new E('bad_value', 'Send {entries: {key: value, ...}} (up to 1000 keys)');
+      store.db.exec('BEGIN');
+      try { for (const [k, v] of Object.entries(b.entries)) services.storage.put(g.id, 'game', '', k, v); store.db.exec('COMMIT'); }
+      catch (e) { store.db.exec('ROLLBACK'); throw e; }
+      return { ok: true, keys: Object.keys(b.entries).length };
+    }
+  }
+  if (sub === 'servers' && arg) {
+    if (m === 'DELETE') return servers.admin(g, 'DELETE', arg, {});
+    if (m === 'PUT' || m === 'PATCH') {
+      const b = await readBody(req), exists = servers.admin(g, 'GET', null, {}).some((x) => x.id === arg);
+      return exists ? servers.admin(g, 'PATCH', arg, b) : servers.admin(g, 'POST', null, { ...b, id: arg });
+    }
+  }
+  if (sub === 'leaderboards' && arg) {
+    if (m === 'PUT') { const b = await readBody(req); return services.adminLeaderboards(g, 'PUT', arg, 'config', null, b, null); }
+    if (m === 'DELETE') return services.adminLeaderboards(g, 'DELETE', arg, null, null, {}, new URL('http://x/?config=delete'));
+    if (m === 'GET') return services.leaderboard.top(g.id, arg, { limit: 100 });
+  }
+  if (sub === 'config') {
+    if (m === 'GET') return g.settings.config || {};
+    if (m === 'PUT') {
+      const b = await readBody(req);
+      if (!isObj(b)) throw new E('bad_data', 'config must be a JSON object');
+      g.settings.config = b; saveGame(g); services.pushConfig(g, online.values());
+      return g.settings.config;
+    }
+  }
+  if (sub === 'logs' && m === 'GET') return { events: gameEvents(g), scriptErrors: scripts.info(g.id).errors || [] };
+  if (sub === 'rooms' && m === 'GET') {
+    return [...rooms.values()].filter((r) => r.game === g).map((r) => ({ ...roomInfo(r), players: r.players.size, queue: r.waiting.length }));
+  }
   if (!sub && m === 'GET') return setup.view(g);
   if (sub === 'recommend' && m === 'POST') { const b = await readBody(req); return setup.recommend(isObj(b.profile) ? b.profile : b); }
   if (!sub && (m === 'PUT' || m === 'POST')) {
@@ -730,7 +817,7 @@ async function setupRoute(g, req, sub, url, asAdmin, res) {
     const dry = url.searchParams.get('dryRun') === '1' || url.searchParams.get('dryRun') === 'true' || b.dryRun === true;
     return setup.apply(g, b, dry);
   }
-  throw new E('not_found', 'Setup API: GET /api/setup · POST /api/setup/recommend · PUT /api/setup[?dryRun=1] · GET|POST /api/setup/messages · POST /api/setup/done');
+  throw new E('not_found', 'Setup API: GET|PUT /api/setup · POST /api/setup/recommend · /script · /storage[/key] · /servers/:id · /leaderboards/:id · /config · /logs · /rooms · /messages · POST /api/setup/done');
 }
 
 const gameSummary = (g, counts) => {
@@ -756,7 +843,7 @@ async function admin(req, res, parts, url) {
         connections: conns.size, online: online.size, rooms: rooms.size, msgIn: stats.in, msgOut: stats.out,
         bytesIn: stats.bytesIn, bytesOut: stats.bytesOut, openGames: CFG.openGames, transports: net.info(), ...services.stats() },
       players: [...online.values()].slice(0, 500).map((c) => ({ game: c.game.id, gameName: c.game.name, id: c.pid, name: c.name,
-        username: c.username, room: c.room ? c.room.id : null, since: c.since, rtt: c.rtt, transport: net.active(c) })),
+        username: c.username, room: c.room ? c.room.id : null, since: c.since, rtt: c.rtt, transport: net.active(c), sdk: c.sdk })),
       history: stats.history, games: [...games.values()].map((g) => gameSummary(g, counts)), events: events.slice(-100).reverse(),
     });
   }
@@ -790,8 +877,8 @@ async function admin(req, res, parts, url) {
         g.settings = safeMerge(g.settings, b.settings);
         if ('config' in b.settings) services.pushConfig(g, online.values()); // remote config goes live at once
       }
-      if (b.rotateKey) { gamesByKey.delete(g.key); g.key = 'pk_' + rid(18); gamesByKey.set(g.key, g); }
-      if (b.rotateSetupKey) g.settings.setupKey = 'sk_' + rid(18);
+      if (b.rotateKey) { gamesByKey.delete(g.key); g.key = newGameKey(); gamesByKey.set(g.key, g); }
+      if (b.rotateSetupKey) g.settings.setupKey = newSetupKey();
       saveGame(g);
       log(g.id, 'game', `Game updated: ${g.name}`);
       return json(res, 200, gameSummary(g, new Map()));
@@ -834,7 +921,7 @@ async function admin(req, res, parts, url) {
     }
   }
   if (sub === 'setup') { // the admin can use the setup API for any game: GET, PUT (?dryRun=1), POST setup/recommend
-    return json(res, 200, await setupRoute(g, req, sid, url, true, res));
+    return json(res, 200, await setupRoute(g, req, sid, url, true, res, act));
   }
   if (sub === 'players' && sid && method === 'POST') {
     const b = act === 'kick' ? await readBody(req) : {};
@@ -859,17 +946,19 @@ async function admin(req, res, parts, url) {
   }
   if (sub === 'kv') {
     if (method === 'GET') {
-      if (url.searchParams.get('key') != null) {
-        const row = S.kvGet.get(g.id, url.searchParams.get('scope') || 'game', url.searchParams.get('owner') || '', url.searchParams.get('key'));
-        return json(res, 200, row ? { value: JSON.parse(row.v), updated: row.updated } : null);
-      }
-      const scope = url.searchParams.get('scope') || '', prefix = url.searchParams.get('prefix') || '';
-      return json(res, 200, S.kvAdminList.all(g.id, scope, scope, prefix, prefix + '￿', Math.min(+url.searchParams.get('limit') || 200, 1000)));
+      const q = (k) => url.searchParams.get(k);
+      if (sid === 'summary') return json(res, 200, services.storage.adminSummary(g.id));
+      if (q('key') != null) return json(res, 200, services.storage.get(g.id, q('scope') || 'game', q('owner') || '', q('key')));
+      return json(res, 200, services.storage.adminList(g.id, { scope: q('scope'), owner: q('owner'), prefix: q('prefix'), search: q('search'),
+        sort: q('sort'), limit: q('limit'), offset: q('offset') }));
     }
     const b = await readBody(req);
     const scope = str(b.scope, 16, 'game'), owner = str(b.owner, 64, ''), key = str(b.key, 128, '');
     if (!key) throw new E('bad_key');
-    if (method === 'PUT') { services.storage.put(g.id, scope, owner, key, b.value); return json(res, 200, { ok: true }); }
+    if (method === 'PUT') { // edits keep the key's expiry unless a new ttl (seconds) is given
+      const version = services.storage.put(g.id, scope, owner, key, b.value, b.ttl != null ? { ttl: b.ttl } : { keepTtl: true });
+      return json(res, 200, { ok: true, version });
+    }
     if (method === 'DELETE') { S.kvDel.run(g.id, scope, owner, key); return json(res, 200, { ok: true }); }
   }
   if (sub === 'leaderboards') {
@@ -914,7 +1003,7 @@ const server = http.createServer(async (req, res) => {
     if (parts[0] === 'api' && parts[1] === 'setup') {
       const g = setupAuth(req, clientIp(req));
       if (!g) return json(res, 401, { error: 'unauthorized', message: 'Send Authorization: Bearer <setup key> (dashboard -> game -> Setup)' });
-      return json(res, 200, await setupRoute(g, req, parts[2], url, false, res));
+      return json(res, 200, await setupRoute(g, req, parts[2], url, false, res, parts[3]));
     }
     if (parts[0] === 'api' && parts[1] === 'admin') {
       if (!isAdmin(req, clientIp(req))) return json(res, 401, { error: 'unauthorized' });

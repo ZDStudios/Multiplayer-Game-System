@@ -115,7 +115,7 @@ const $ = (s, el = document) => el.querySelector(s);
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtDur = (ms) => { const s = Math.floor(ms / 1000), d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`; };
 const ago = (t) => !t ? '—' : Date.now() - t < 5000 ? 'now' : fmtDur(Date.now() - t) + ' ago';
-const bytes = (n) => n > 1e9 ? (n / 1e9).toFixed(1) + ' GB' : n > 1e6 ? (n / 1e6).toFixed(1) + ' MB' : (n / 1e3).toFixed(0) + ' KB';
+const bytes = (n) => n > 1e9 ? (n / 1e9).toFixed(1) + ' GB' : n > 1e6 ? (n / 1e6).toFixed(1) + ' MB' : n >= 1e3 ? (n / 1e3).toFixed(n < 1e4 ? 1 : 0) + ' KB' : (n || 0) + ' B';
 const pretty = (j) => { try { return JSON.stringify(JSON.parse(j), null, 2); } catch { return j; } };
 const ping = (ms) => ms == null ? '<span class="mute">—</span>' : `<span style="color:var(--${ms < 150 ? 'ok' : ms < 300 ? 'warn' : 'bad'})">${ms} ms</span>`;
 const num = (n) => Number(n || 0).toLocaleString();
@@ -157,6 +157,7 @@ function start() {
   clearInterval(timer); tick(); timer = setInterval(tick, 2000);
 }
 let paused = false;
+const kvState = { scope: '', owner: '', prefix: '', search: '', sort: 'updated' }; // storage browser filters (kept across re-renders)
 async function tick(force) {
   if (current && paused && force !== true) return;
   try {
@@ -271,8 +272,12 @@ Do this in order (send every setup call with header "Authorization: Bearer <setu
 3. GET ${SERVER}/api/setup to see the current setup, the schema and live metrics.
 4. POST ${SERVER}/api/setup/recommend with {"profile": {...}}. Review the recommended setup, estimates and notes, and adjust anything that doesn't fit this game (room types, max players, interest radius, servers, leaderboards, storage rules, remote config, server script).
 5. PUT ${SERVER}/api/setup?dryRun=1 with the final setup document; fix errors and warnings; then PUT ${SERVER}/api/setup to apply it. Keep the profile accurate: the dashboard compares it against measured player counts, update rates and ping.
+   You can also change things one at a time:
+   - Server logic: PUT ${SERVER}/api/setup/script with the file as the body (content-type text/javascript). If it fails to load you get HTTP 400 and the previous script keeps running. GET /api/setup/script shows the code and errors; GET /api/setup/logs shows console.log output and recent events.
+   - Shared game data (items, quests, tuning tables): PUT /api/setup/storage {"entries": {key: value}}, PUT /api/setup/storage/<key> {"value": ...}, GET /api/setup/storage?prefix=..., DELETE /api/setup/storage/<key>.
+   - PUT|DELETE /api/setup/servers/<id>, PUT|DELETE /api/setup/leaderboards/<id>, PUT /api/setup/config (remote config), GET /api/setup/rooms.
 6. Integrate the SDK in the game following MULTIPLAYER.md, using the room types / servers you configured. Test it.
-7. When everything works, POST ${SERVER}/api/setup/done {"summary": "what you configured and why"}. This closes the setup API for good; after that only I can change game settings, in the dashboard. Don't call it before you're finished.
+7. When everything works, POST ${SERVER}/api/setup/done {"summary": "what you configured and why"}. This locks the setup API for good: every later call, from you or anyone with the key, is refused, and only I can change game settings, in the dashboard. Don't call it before you're finished.
 8. Tell me what you chose and why, and anything I should check in the dashboard.`;
 }
 
@@ -383,10 +388,29 @@ async function renderDetail() {
       <div class="mute" style="margin:14px 0 6px" id="srvTitle">New server (JSON)</div>
       <textarea id="srvCfg" spellcheck="false" style="height:200px;font:12.5px/1.45 var(--mono)">${esc(JSON.stringify(SERVER_TEMPLATE, null, 2))}</textarea>
       <div class="row" style="margin-top:6px"><span class="mute">Fields: id, name, description, region, tags, maxPlayers, password, visibility (public | unlisted), whitelist, queue, motd, type, options (any room option, e.g. aoi), enabled.</span><span class="sp"></span><button class="sm" id="srvNew">Clear</button><button class="sm primary" id="srvSave">Create server</button></div></div>`;
-  if (detailTab === 'storage') body = `<div class="row nore"><select id="kvScope" style="width:auto"><option value="">all scopes</option><option>game</option><option>player</option><option>private</option><option>room</option></select>
-      <input id="kvPrefix" placeholder="key prefix" style="width:200px"><button class="sm" id="kvLoad">Search</button></div>
-      <div class="tablewrap"><table style="margin-top:10px"><thead><tr><th>Scope</th><th>Owner</th><th>Key</th><th>Size</th><th>Updated</th><th></th></tr></thead><tbody id="kvRows"><tr><td colspan="6" class="empty">${num(g.kvEntries)} entries — search to browse</td></tr></tbody></table></div><pre id="kvOut" class="hidden"></pre>
-      <div class="row nore" style="margin-top:14px"><input id="kvKey" placeholder="game key (e.g. config)" style="width:200px"><input id="kvVal" placeholder='JSON value, e.g. {"maxSpeed":5}' style="flex:1"><button class="sm" id="kvSet">Set game value</button></div>`;
+  if (detailTab === 'storage') {
+    const sum = await api('GET', `/games/${g.id}/kv/summary`);
+    const total = Object.values(sum).reduce((a, x) => a + x.keys, 0);
+    const chip = (scope, label, x) => `<button class="sm ${kvState.scope === scope ? 'primary' : ''}" data-kvscope="${scope}">${label} <span class="mute">${num(x ? x.keys : 0)}</span></button>`;
+    body = `<div class="nore">
+      <div class="row" style="flex-wrap:wrap;gap:6px;margin-bottom:8px">${chip('', 'All', { keys: total })}${chip('game', 'Game', sum.game)}${chip('player', 'Player (public)', sum.player)}${chip('private', 'Private', sum.private)}${chip('room', 'Saved rooms', sum.room)}
+        <span class="sp"></span><span class="mute">${num(total)} keys · ${bytes(Object.values(sum).reduce((a, x) => a + (x.bytes || 0), 0))}</span></div>
+      <div class="row" style="flex-wrap:wrap;gap:6px">
+        <input id="kvOwner" placeholder="player name or id" value="${esc(kvState.owner)}" style="width:170px">
+        <input id="kvPrefix" placeholder="key starts with…" value="${esc(kvState.prefix)}" style="width:150px">
+        <input id="kvSearch" placeholder="search keys + values" value="${esc(kvState.search)}" style="flex:1;min-width:140px">
+        <select id="kvSort" style="width:auto"><option value="updated">newest first</option><option value="key" ${kvState.sort === 'key' ? 'selected' : ''}>by owner / key</option><option value="size" ${kvState.sort === 'size' ? 'selected' : ''}>largest first</option></select>
+        <button class="sm" id="kvLoad">Search</button><button class="sm" id="kvNew">+ New entry</button></div>
+      <div id="kvForm" class="hidden" style="margin-top:10px;border:1px solid var(--line);border-radius:8px;padding:10px">
+        <div class="row" style="flex-wrap:wrap;gap:6px"><select id="kvfScope" style="width:auto"><option value="game">game</option><option value="player">player</option><option value="private">private</option></select>
+          <input id="kvfOwner" placeholder="player id (player / private)" style="width:200px"><input id="kvfKey" placeholder="key" style="flex:1;min-width:140px"></div>
+        <textarea id="kvfVal" spellcheck="false" placeholder='JSON value, e.g. {"level": 3}' style="height:110px;margin-top:6px;font:12.5px/1.45 var(--mono)"></textarea>
+        <div class="row" style="margin-top:6px"><span class="sp"></span><button class="sm" id="kvfCancel">Cancel</button><button class="sm primary" id="kvfSave">Save</button></div></div>
+      <div class="tablewrap" style="margin-top:10px"><table><thead><tr><th>Scope</th><th>Owner</th><th>Key</th><th>Value</th><th>Size</th><th>Ver</th><th>Updated</th></tr></thead>
+        <tbody id="kvRows"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody></table></div>
+      <div class="row" style="margin-top:8px"><span class="mute" id="kvCount"></span><span class="sp"></span><button class="sm hidden" id="kvMore">Load more</button></div>
+      <div class="mute" style="margin-top:6px">Click a row to see, edit or delete the full value. Player = data the player owns and anyone can read; private = only that player; game = shared by everyone; saved rooms = state of persistent rooms and public servers.</div></div>`;
+  }
   if (detailTab === 'server logic') body = `<div class="nore">
       <div class="row" style="margin-bottom:8px"><span id="scStatus" class="mute">Loading…</span><span class="sp"></span>
         <button class="sm" id="scExample">Insert example</button><button class="sm danger" id="scRemove">Remove</button><button class="sm primary" id="scSave">Save &amp; deploy</button></div>
@@ -430,17 +454,67 @@ async function renderDetail() {
   document.querySelectorAll('#detail [data-lbview]').forEach((b) => b.onclick = async () => { const rows = await api('GET', `/games/${g.id}/leaderboards/${encodeURIComponent(b.dataset.lbview)}`); const o = $('#lbOut'); o.classList.remove('hidden'); o.textContent = rows.map((r, i) => `${String(i + 1).padStart(3)}. ${String(r.score).padStart(10)}  ${r.name}  (${r.id})`).join('\n'); clearInterval(timer); });
   document.querySelectorAll('#detail [data-lbdel]').forEach((b) => b.onclick = async () => { if (confirm('Reset leaderboard ' + b.dataset.lbdel + '?')) { await api('DELETE', `/games/${g.id}/leaderboards/${encodeURIComponent(b.dataset.lbdel)}`); tick(true); } });
   if (detailTab === 'storage') {
-    const load = async () => {
-      const rows = await api('GET', `/games/${g.id}/kv?scope=${encodeURIComponent($('#kvScope').value)}&prefix=${encodeURIComponent($('#kvPrefix').value)}`);
-      $('#kvRows').innerHTML = rows.map((r, i) => `<tr><td><span class="tag">${esc(r.scope)}</span></td><td class="mono mute">${esc(r.owner || '—')}</td><td class="mono">${esc(r.k)}</td><td class="mute">${bytes(r.size)}</td><td class="mute">${ago(r.updated)}</td>
-        <td><button class="sm" data-kvv="${i}">View</button> <button class="sm danger" data-kvd="${i}">Delete</button></td></tr>`).join('') || '<tr><td colspan="6" class="empty">No matches</td></tr>';
-      document.querySelectorAll('[data-kvv]').forEach((b) => b.onclick = async () => { const r = rows[b.dataset.kvv]; const v = await api('GET', `/games/${g.id}/kv?scope=${encodeURIComponent(r.scope)}&owner=${encodeURIComponent(r.owner)}&key=${encodeURIComponent(r.k)}`); const o = $('#kvOut'); o.classList.remove('hidden'); o.textContent = JSON.stringify(v && v.value, null, 2); });
-      document.querySelectorAll('[data-kvd]').forEach((b) => b.onclick = async () => { const r = rows[b.dataset.kvd]; if (!confirm('Delete ' + r.k + '?')) return; await api('DELETE', `/games/${g.id}/kv`, { scope: r.scope, owner: r.owner, key: r.k }); load(); });
+    let rows = [];
+    const qs = () => new URLSearchParams({ scope: kvState.scope, owner: kvState.owner, prefix: kvState.prefix, search: kvState.search, sort: kvState.sort, limit: 100, offset: rows.length }).toString();
+    const ownerCell = (r) => r.scope === 'game' ? '<span class="mute">everyone</span>' : `${r.ownerName ? `<b>${esc(r.ownerName)}</b> ` : ''}<span class="mono mute">${esc(r.owner)}</span>`;
+    const exp = (r) => (r.expires ? ` <span class="tag">expires ${new Date(r.expires).toLocaleString()}</span>` : '');
+    const draw = () => {
+      $('#kvRows').innerHTML = rows.map((r, i) => `<tr class="click" data-kvi="${i}"><td><span class="tag">${esc(r.scope)}</span></td><td>${ownerCell(r)}</td><td class="mono">${esc(r.k)}${exp(r)}</td>
+        <td class="mono mute" style="max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.preview)}</td><td class="mute">${bytes(r.size)}</td><td class="mute">${r.version}</td><td class="mute">${ago(r.updated)}</td></tr>
+        <tr class="hidden" id="kvd${i}"><td colspan="7"><textarea spellcheck="false" style="height:200px;font:12.5px/1.45 var(--mono)" id="kvv${i}">Loading…</textarea>
+          <div class="row" style="margin-top:6px"><span class="mute">${esc(r.scope)} · ${esc(r.owner || 'game')} · ${esc(r.k)} · version ${r.version}</span><span class="sp"></span>
+          <button class="sm" data-kvcopy="${i}">Copy</button><button class="sm danger" data-kvdel="${i}">Delete</button><button class="sm primary" data-kvsave="${i}">Save</button></div></td></tr>`).join('')
+        || '<tr><td colspan="7" class="empty">No matching keys</td></tr>';
+      $('#kvCount').textContent = rows.length ? `${num(rows.length)} shown` : '';
+      document.querySelectorAll('[data-kvi]').forEach((tr) => tr.onclick = async () => {
+        const i = +tr.dataset.kvi, d = $('#kvd' + i), r = rows[i];
+        d.classList.toggle('hidden');
+        if (d.classList.contains('hidden')) return;
+        const v = await api('GET', `/games/${g.id}/kv?` + new URLSearchParams({ scope: r.scope, owner: r.owner, key: r.k }));
+        $('#kvv' + i).value = v ? JSON.stringify(v.value, null, 2) : '(deleted)';
+      });
+      document.querySelectorAll('[data-kvcopy]').forEach((b) => b.onclick = () => copy($('#kvv' + b.dataset.kvcopy).value));
+      document.querySelectorAll('[data-kvsave]').forEach((b) => b.onclick = async () => {
+        const r = rows[b.dataset.kvsave]; let v;
+        try { v = JSON.parse($('#kvv' + b.dataset.kvsave).value); } catch (e) { return toast('Not valid JSON'); }
+        await api('PUT', `/games/${g.id}/kv`, { scope: r.scope, owner: r.owner, key: r.k, value: v }); toast('Saved'); reload();
+      });
+      document.querySelectorAll('[data-kvdel]').forEach((b) => b.onclick = async () => {
+        const r = rows[b.dataset.kvdel];
+        if (!confirm(`Delete ${r.scope} key "${r.k}"${r.owner ? ' of ' + (r.ownerName || r.owner) : ''}? This can't be undone.`)) return;
+        await api('DELETE', `/games/${g.id}/kv`, { scope: r.scope, owner: r.owner, key: r.k }); toast('Deleted'); reload();
+      });
     };
-    $('#kvLoad').onclick = load;
-    $('#kvSet').onclick = async () => { let v; try { v = JSON.parse($('#kvVal').value); } catch { v = $('#kvVal').value; } await api('PUT', `/games/${g.id}/kv`, { scope: 'game', key: $('#kvKey').value, value: v }); toast('Saved'); load(); };
+    const more = async () => {
+      const page = await api('GET', `/games/${g.id}/kv?` + qs());
+      rows = rows.concat(page);
+      $('#kvMore').classList.toggle('hidden', page.length < 100);
+      draw();
+    };
+    const reload = () => { rows = []; return more(); };
+    const readFilters = () => { kvState.owner = $('#kvOwner').value.trim(); kvState.prefix = $('#kvPrefix').value; kvState.search = $('#kvSearch').value.trim(); kvState.sort = $('#kvSort').value; };
+    $('#kvLoad').onclick = () => { readFilters(); reload(); };
+    ['#kvOwner', '#kvPrefix', '#kvSearch'].forEach((id) => $(id).onkeydown = (e) => { if (e.key === 'Enter') { readFilters(); reload(); } });
+    $('#kvSort').onchange = () => { readFilters(); reload(); };
+    $('#kvMore').onclick = more;
+    document.querySelectorAll('[data-kvscope]').forEach((b) => b.onclick = () => {
+      readFilters(); kvState.scope = b.dataset.kvscope;
+      if (kvState.scope === 'game') kvState.owner = ''; // game data has no owner
+      tick(true);
+    });
+    $('#kvNew').onclick = () => $('#kvForm').classList.toggle('hidden');
+    $('#kvfCancel').onclick = () => $('#kvForm').classList.add('hidden');
+    $('#kvfSave').onclick = async () => {
+      let v; try { v = JSON.parse($('#kvfVal').value); } catch (e) { return toast('Value must be JSON (strings need quotes)'); }
+      const scope = $('#kvfScope').value, owner = scope === 'game' ? '' : $('#kvfOwner').value.trim();
+      if (!$('#kvfKey').value) return toast('Key is required');
+      if (scope !== 'game' && !owner) return toast('Player id is required for player / private data');
+      try { await api('PUT', `/games/${g.id}/kv`, { scope, owner, key: $('#kvfKey').value, value: v }); } catch (e) { return toast(e.message); }
+      toast('Saved'); $('#kvForm').classList.add('hidden'); readFilters(); reload();
+    };
+    reload();
   }
-  paused = !['rooms', 'players'].includes(detailTab); // live-refresh only the live tabs
+  paused = !['rooms', 'players', 'setup'].includes(detailTab); // live-refresh only the live tabs (setup: the chat)
   if (detailTab === 'server logic') {
     const show = (info) => {
       $('#scStatus').innerHTML = !info.code && !info.loaded ? 'No server script — clients/host run the logic.'
