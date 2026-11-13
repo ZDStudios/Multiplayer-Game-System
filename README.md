@@ -15,7 +15,7 @@ A self-hosted, game-agnostic multiplayer backend. One Docker stack on your VPS g
 - **Social and meta-game**: friends (requests, blocking), live presence, player lookup, a persistent inbox for offline players (gifts, invites, rewards), rating-based matchmaking queues, game-wide chat channels with history, and remote config pushed live from the dashboard. Server scripts can use storage, leaderboards and the inbox directly.
 - **Accounts**: optional username/password accounts that keep the same player across devices.
 - **Admin**: one-click shut down / start per game, kick or ban any online player, plus a dashboard (static HTML that runs on GitHub Pages or from the server itself) with live traffic, games, rooms, players, storage browser, leaderboards and broadcasts.
-- **Security**: per-game public keys, an admin bearer token, HMAC-signed player tokens, scrypt passwords, rate limits, message size caps, origin allow-lists, auto-HTTPS via Caddy.
+- **Security**: per-game public keys (`pk_` + 32 random characters; rotate in the dashboard), secret per-game setup keys, an admin bearer token, HMAC-signed player tokens, scrypt passwords, rate limits, message size caps, origin allow-lists, auto-HTTPS via Caddy.
 
 ![Dashboard overview: live players, rooms, traffic and games](docs/images/dashboard.jpg)
 
@@ -105,7 +105,8 @@ Push the repo, then go to **Settings → Pages → Deploy from branch → `main`
 
 ```bash
 cd server && npm install && npm start     # http://localhost:8080, admin token printed on first run
-npm test                                  # end-to-end smoke test (106 checks: rooms, setup API, public servers, open-world interest management, room types, storage, leaderboards, social, inbox, matchmaking, chat, UDP/WebRTC, packet loss, failover)
+npm test                                  # smoke test (119 checks) + compatibility test: every SDK version ever released (test/compat) against this server (31 checks)
+# the smoke test covers rooms, setup API, public servers, open-world interest management, room types, storage, leaderboards, social, inbox, matchmaking, chat, UDP/WebRTC, packet loss and failover
 ```
 
 ## Configuration (`.env`)
@@ -131,7 +132,7 @@ npm test                                  # end-to-end smoke test (106 checks: r
 
 ## Setup API (per game, for coding agents)
 
-`Authorization: Bearer SETUP_KEY` (dashboard → game → Setup). The key only reaches that game's configuration, never other games, players or the admin API. `GET /api/setup` · `POST /api/setup/recommend` (`{profile}`) · `PUT /api/setup` (`?dryRun=1`) · `GET|POST /api/setup/messages` (the setup chat with the dashboard; `?wait=60` long-polls for your reply) · `POST /api/setup/done` (`{summary}`: closes the setup API, after which settings change only in the dashboard). See MULTIPLAYER.md §0. Rotate the key in the dashboard to revoke it; **Re-open setup** issues a new key after done.
+`Authorization: Bearer SETUP_KEY` (dashboard → game → Setup). The key only reaches that game's configuration, never other games, players or the admin API. `GET /api/setup` · `POST /api/setup/recommend` (`{profile}`) · `PUT /api/setup` (`?dryRun=1`) · `GET|PUT|DELETE /api/setup/script` (upload the server script as a file; a failing upload keeps the old one) · `GET|PUT|DELETE /api/setup/storage[/key]` (shared game data) · `PUT|DELETE /api/setup/servers/:id` · `PUT|DELETE /api/setup/leaderboards/:id` · `GET|PUT /api/setup/config` · `GET /api/setup/logs` · `GET /api/setup/rooms` · `GET|POST /api/setup/messages` (the setup chat with the dashboard; `?wait=60` long-polls for your reply) · `POST /api/setup/done` (`{summary}`: closes the setup API, after which settings change only in the dashboard). See MULTIPLAYER.md §0. Rotate the key in the dashboard to revoke it; **Re-open setup** issues a new key after done.
 
 Admin equivalents: `GET|PUT /api/admin/games/:id/setup`, `GET|POST /api/admin/games/:id/setup/messages` (your replies), `POST /api/admin/games/:id/setup/reopen`.
 

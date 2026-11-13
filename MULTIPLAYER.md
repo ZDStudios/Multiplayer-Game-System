@@ -22,9 +22,16 @@ All calls take `Authorization: Bearer SETUP_KEY` and JSON bodies:
 | `POST SERVER_URL/api/setup/recommend` `{profile}` | Returns `{setup, estimates, notes}`: a complete setup document sized for the profile. |
 | `PUT SERVER_URL/api/setup?dryRun=1` `{...setup}` | Validates only and returns `{applied, warnings}`. |
 | `PUT SERVER_URL/api/setup` `{...setup}` | Applies it. Every field is optional; omitted fields stay as they are. If anything is invalid, nothing is applied (HTTP 400 with the field in `message`). |
+| `PUT SERVER_URL/api/setup/script` (the file, `content-type: text/javascript`, or `{code}`) | Uploads the server script (§5b). If it fails to load: HTTP 400 `bad_script`, and the previous script keeps running. `GET` returns `{code, loaded, hooks, errors}`; `DELETE` removes it. |
+| `GET SERVER_URL/api/setup/logs` | Recent events for this game, including your script's `console.log` output and script errors. |
+| `PUT SERVER_URL/api/setup/storage` `{entries: {key: value}}` · `PUT …/storage/KEY` `{value, ttl?}` · `GET …/storage?prefix=` · `GET`/`DELETE …/storage/KEY` | Shared game data (scope `game`) that clients read with `mp.storage.get(key, {scope: 'game'})`: items, quests, level lists, tuning tables. |
+| `PUT`/`DELETE SERVER_URL/api/setup/servers/ID` | Create or update / delete one public server. |
+| `PUT`/`DELETE SERVER_URL/api/setup/leaderboards/ID` | Set a board's config / reset it and drop the config. `GET` shows the top 100. |
+| `GET`/`PUT SERVER_URL/api/setup/config` | Remote config (`mp.config`), pushed live to players. |
+| `GET SERVER_URL/api/setup/rooms` | Live rooms of this game (id, type, players, queue). |
 | `POST SERVER_URL/api/setup/messages` `{text}` | Posts to the **setup chat** in the user's dashboard. Use it for what you found, what you plan, and real questions. |
 | `GET SERVER_URL/api/setup/messages?after=ID&wait=60` | Reads the chat after message `ID`. `wait` (seconds, max 60) holds the request open until the user replies. Returns `{status, messages: [{id, sender: 'agent'\|'admin', text, created}]}`. |
-| `POST SERVER_URL/api/setup/done` `{summary}` | **Finishes setup.** Posts the summary and closes the setup API for good: every later call gets HTTP 403 `setup_closed`, and game settings can only be changed in the dashboard. The user can re-open setup there with a new key. Call it only when the game is integrated and working. |
+| `POST SERVER_URL/api/setup/done` `{summary}` | **Finishes setup and locks the API.** It posts the summary, then every later call with this key, from you or anyone else, gets HTTP 403 `setup_closed`, including uploads and chat. From then on game settings can only be changed in the dashboard, where the user can re-open setup with a new key. Call it only when the game is integrated and working. |
 
 **1. Describe the game (`profile`).** Work it out from the game's code and design. The dashboard shows it next to the measured numbers, so keep it realistic.
 ```jsonc

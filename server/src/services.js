@@ -162,7 +162,26 @@ export function createServices(d) {
     }
     return [scope, c.pid];
   }
-  const storage = { get: sGet, put: sPut, del: sDel, update: sUpdate, incr: sIncr, list: sList, query: sQuery, applyOps };
+  // Dashboard storage browser: every scope (incl. 'room' saves), filters, value previews, player names.
+  const summaryQ = q(`SELECT scope, COUNT(*) AS keys, COUNT(DISTINCT owner) AS owners, SUM(length(v)) AS bytes FROM kv
+                      WHERE game = ? AND (expires IS NULL OR expires > ?) GROUP BY scope`);
+  const adminSummary = (gid) => Object.fromEntries(summaryQ.all(gid, now()).map((r) => [r.scope, { keys: r.keys, owners: r.owners, bytes: r.bytes }]));
+  const like = (v) => '%' + String(v).replace(/[!%_]/g, (x) => '!' + x) + '%'; // LIKE pattern with ! as the escape char
+  function adminList(gid, o = {}) {
+    let sql = `SELECT kv.scope, kv.owner, kv.k, length(kv.v) AS size, substr(kv.v, 1, 240) AS preview, kv.ver, kv.expires, kv.updated, p.name AS ownerName
+      FROM kv LEFT JOIN players p ON p.game = kv.game AND p.id = kv.owner WHERE kv.game = ? AND (kv.expires IS NULL OR kv.expires > ?)`;
+    const args = [gid, now()];
+    if (o.scope) { sql += ' AND kv.scope = ?'; args.push(String(o.scope)); }
+    if (o.owner) { sql += " AND (kv.owner = ? OR p.name LIKE ? ESCAPE '!')"; args.push(String(o.owner), like(o.owner)); }
+    if (o.prefix) { sql += ' AND kv.k >= ? AND kv.k < ?'; args.push(String(o.prefix), String(o.prefix) + '￿'); }
+    if (o.search) { sql += " AND (kv.k LIKE ? ESCAPE '!' OR kv.v LIKE ? ESCAPE '!')"; args.push(like(o.search), like(o.search)); }
+    sql += o.sort === 'key' ? ' ORDER BY kv.scope, kv.owner, kv.k' : o.sort === 'size' ? ' ORDER BY size DESC' : ' ORDER BY kv.updated DESC';
+    sql += ' LIMIT ? OFFSET ?';
+    args.push(clamp(o.limit, 1, 500, 100), clamp(o.offset, 0, 1e7, 0));
+    return db.prepare(sql).all(...args).map((r) => ({ scope: r.scope, owner: r.owner, ownerName: r.ownerName, k: r.k, size: r.size,
+      preview: r.preview.length < r.size ? r.preview + '…' : r.preview, version: r.ver, expires: r.expires, updated: r.updated }));
+  }
+  const storage = { get: sGet, put: sPut, del: sDel, update: sUpdate, incr: sIncr, list: sList, query: sQuery, applyOps, adminList, adminSummary };
 
   // ==================================================== leaderboards ====================================================
   const BOARD_RE = /^[A-Za-z0-9_\-.:]{1,64}$/;
@@ -409,7 +428,7 @@ export function createServices(d) {
       try { d.joinRoom(x.c, roomId, o); joined.push(x.c); } catch (e) { send(x.c, { t: 'mm.cancelled', queue: x.queue, reason: e.code || 'join_failed' }); }
     }
     const room = joined.length && joined[0].room;
-    for (const c of joined) if (c.room === room) send(c, { t: 'matched', queue: first.queue, room: d.snapshot(room) });
+    for (const c of joined) if (c.room === room) send(c, { t: 'matched', queue: first.queue, room: d.snapshot(room, c.pid) });
   }
 
   // ======================================================== chat ========================================================
@@ -444,7 +463,11 @@ export function createServices(d) {
       for (const k of m.keys) { const r = sGet(c.game.id, s, o, k); out[k] = m.meta ? r : r ? r.value : null; }
       return out;
     },
-    'kv.set'(c, m) { const [s, o] = target(c, m, true); return { version: sPut(c.game.id, s, o, m.key, m.value, { ifVersion: m.ifVersion, ttl: m.ttl }) }; },
+    'kv.set'(c, m) {
+      const [s, o] = target(c, m, true);
+      const version = sPut(c.game.id, s, o, m.key, m.value, { ifVersion: m.ifVersion, ttl: m.ttl });
+      return c.legacy ? true : { version }; // the original SDK (protocol v1) got `true` here
+    },
     'kv.setMany'(c, m) {
       const [s, o] = target(c, m, true);
       if (!isObj(m.entries) || Object.keys(m.entries).length > 100) throw new E('bad_value', 'entries: an object of up to 100 keys');

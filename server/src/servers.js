@@ -1,6 +1,8 @@
 // Public servers: permanent, listed rooms the admin defines, like the server list of an open-world or survival
 // game. Each one is a room that never closes when empty, saves its state, and shows up in mp.servers.list()
 // with its player count, region and tags. Players join with mp.joinServer(id), and wait in a queue when it's full.
+import crypto from 'node:crypto';
+
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const SAVE_EVERY_MS = 30000;
 
@@ -111,7 +113,7 @@ export function createServers(d) {
         return live && live.server ? info(live, true) : { id: r.id, ...JSON.parse(r.config), running: false };
       });
       if (method !== 'POST') throw new E('not_found');
-      const id = body.id ? String(body.id) : 'srv_' + Math.random().toString(36).slice(2, 8);
+      const id = body.id ? String(body.id) : 'srv_' + crypto.randomBytes(6).toString('hex');
       if (!ID_RE.test(id)) throw new E('bad_room_id', 'Server ids: [A-Za-z0-9_-]{1,64}');
       if (rooms.get(rkey(g.id, id)) && !rooms.get(rkey(g.id, id)).server) throw new E('room_exists', 'A normal room with this id is open');
       const cfg = normalize(g, body);

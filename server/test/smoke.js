@@ -326,6 +326,9 @@ try {
   await v1.joinServer('eu-1');
   assert.equal(v1.state.world.day, 3); assert.equal(v1.room.server, 'EU #1'); ok('servers: stay open when empty and keep their state');
   await v2.joinServer('eu-1');
+  const hostOf = [v1, v2].find((x) => x.isHost);
+  await assert.rejects(hostOf.updateRoom({ locked: true }), { code: 'forbidden' });
+  await assert.rejects(hostOf.kick([v1, v2].find((x) => x !== hostOf).playerId), { code: 'forbidden' }); ok('servers: players get no host powers (lock/kick) on public servers');
   await assert.rejects(v3.joinServer('eu-1', { queue: false }), { code: 'room_full' });
   const pos = new Promise((r) => v3.once('queue', r));
   const queued = v3.joinServer('eu-1');
@@ -347,6 +350,16 @@ try {
   assert.equal(await kicked, 'server_deleted'); await cancelled3; ok('servers: delete closes the server and its queue');
   for (const x of [v1, v2, v3]) x.disconnect();
 
+  {
+    const stay = await pw('Stay');
+    await stay.join('KEEP1');
+    await assert.rejects(stay.create({ aoi: { radius: -1 } }), { code: 'bad_aoi' });
+    assert.equal(stay.room.id, 'KEEP1');
+    assert.equal((await stay.servers.list()).length >= 0, true);
+    const det = (await api('GET', `/games/${game.id}`)).body;
+    assert.ok(det.rooms.find((r) => r.id === 'KEEP1').players.some((p) => p.id === stay.playerId)); ok('join: a room that fails to be created leaves you in your current room');
+    stay.disconnect();
+  }
   // ---- room types + per-game limits ----
   await api('PATCH', `/games/${game.id}`, { settings: { requireRoomType: true,
     roomTypes: { duel: { maxPlayers: 2, stateWrite: 'host', meta: { mode: 'duel' } }, world: { maxPlayers: 500, aoi: { radius: 100 } } } } });
@@ -477,6 +490,54 @@ try {
     assert.notEqual(reo.setupKey, sk2);
     assert.equal((await sapi('GET', '', null, sk2)).status, 401);
     assert.equal((await sapi('GET', '', null, reo.setupKey)).body.status, 'in_progress'); ok('setup re-open: new key works, the old one stays dead');
+    // direct uploads through the setup API
+    const k3 = reo.setupKey;
+    assert.match(k3, /^sk_[A-Za-z0-9]{32}$/); assert.match(other.key, /^pk_[A-Za-z0-9]{32}$/); ok('keys: game and setup keys are 32 random [A-Za-z0-9] characters');
+    const raw = async (method, p, body, type) => {
+      const r = await fetch(BASE + '/api/setup' + p, { method, headers: { authorization: 'Bearer ' + k3, 'content-type': type }, body });
+      return { status: r.status, body: await r.json() };
+    };
+    const good = 'module.exports = { onMessage(room, p, type) { if (type === "ping2") room.send("pong2", 1, p.id); } };';
+    const up = await raw('PUT', '/script', good, 'text/javascript');
+    assert.equal(up.status, 200); assert.equal(up.body.loaded, true);
+    const broken = await raw('PUT', '/script', 'throw new Error("boom at load")', 'text/javascript');
+    assert.equal(broken.status, 400); assert.equal(broken.body.error, 'bad_script'); assert.match(broken.body.message, /previous script is still running/);
+    const sc = (await sapi('GET', '/script', null, k3)).body;
+    assert.equal(sc.code, good); assert.equal(sc.loaded, true); ok('setup upload: raw script file; a failing upload keeps the previous script running');
+    await sapi('PUT', '/storage', { entries: { 'items:sword': { dmg: 5 }, 'items:bow': { dmg: 3 } } }, k3);
+    await sapi('PUT', '/storage/motd', { value: 'Hello!' }, k3);
+    assert.deepEqual((await sapi('GET', '/storage?prefix=items:', null, k3)).body.map((x) => x.key), ['items:bow', 'items:sword']);
+    const pl = new Multiplayer({ url: BASE, key: game.key, name: 'Reader', transports: ['websocket'] }); await pl.connect();
+    assert.equal(await pl.storage.get('motd', { scope: 'game' }), 'Hello!');
+    await sapi('DELETE', '/storage/motd', null, k3);
+    assert.equal(await pl.storage.get('motd', { scope: 'game' }), null); ok('setup upload: game data (bulk, single key, list, delete) readable by clients');
+    assert.equal((await sapi('PUT', '/servers/eu-9', { name: 'EU 9', maxPlayers: 30 }, k3)).body.id, 'eu-9');
+    assert.equal((await sapi('PUT', '/servers/eu-9', { maxPlayers: 40 }, k3)).body.maxPlayers, 40);
+    assert.equal((await sapi('PUT', '/leaderboards/speedrun', { mode: 'min', periods: ['week'] }, k3)).body.sort, 'asc');
+    assert.deepEqual((await sapi('PUT', '/config', { season: 3 }, k3)).body, { season: 3 });
+    const logs = (await sapi('GET', '/logs', null, k3)).body;
+    assert.ok(logs.events.some((e) => /Server script/.test(e.text)) && Array.isArray(logs.scriptErrors));
+    assert.ok(Array.isArray((await sapi('GET', '/rooms', null, k3)).body)); ok('setup upload: servers, leaderboards, remote config, logs and rooms endpoints');
+    await sapi('POST', '/done', { summary: 'ok' }, k3);
+    for (const [m2, p2, b2] of [['PUT', '/storage/x', { value: 1 }], ['GET', '/script'], ['PUT', '/servers/eu-9', { maxPlayers: 1 }], ['PUT', '/config', { a: 1 }], ['DELETE', '/leaderboards/speedrun']]) {
+      assert.equal((await sapi(m2, p2, b2, k3)).status, 403);
+    }
+    assert.equal((await raw('PUT', '/script', good, 'text/javascript')).status, 403);
+    assert.equal((await api('GET', `/games/${game.id}/servers/eu-9`)).body.maxPlayers, 40); ok('setup lock: after done every upload endpoint is refused (403), nothing changes');
+
+    // storage browser (admin)
+    const sumKv = (await api('GET', `/games/${game.id}/kv/summary`)).body;
+    assert.ok(sumKv.game.keys >= 2 && sumKv.player.keys >= 1);
+    const found = (await api('GET', `/games/${game.id}/kv?search=sword`)).body;
+    assert.ok(found.some((r) => r.k === 'items:sword' && /dmg/.test(r.preview) && r.version === 1));
+    const byName = (await api('GET', `/games/${game.id}/kv?scope=player&owner=Xen`)).body;
+    assert.ok(byName.length && byName.every((r) => r.ownerName === 'Xena')); ok('storage browser: per-scope summary, search in keys + values, filter by player name');
+    await api('PUT', `/games/${game.id}/kv`, { scope: 'game', key: 'ttl_edit', value: 1, ttl: 600 });
+    await api('PUT', `/games/${game.id}/kv`, { scope: 'game', key: 'ttl_edit', value: 2 });
+    const te = (await api('GET', `/games/${game.id}/kv?scope=game&key=ttl_edit`)).body;
+    assert.equal(te.value, 2); assert.ok(te.expires > Date.now() && te.version === 2); ok('storage browser: editing a value keeps its expiry');
+    assert.equal((await api('GET', '/overview')).body.players.find((x) => x.id === pl.playerId).sdk, Multiplayer.VERSION); ok('dashboard shows each player\'s SDK version');
+    pl.disconnect();
     // back to an open configuration for the remaining tests
     await api('PUT', `/games/${game.id}/setup`, { requireRoomType: false, roomTypes: {}, limits: {}, storage: { playerDataWrite: 'all', gameDataWrite: 'all' }, lockLeaderboards: false, script: '', servers: [], replaceServers: true });
     cl.disconnect();
