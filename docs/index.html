@@ -262,12 +262,13 @@ Integration guide: ${SERVER}/MULTIPLAYER.md (fetch and follow it${open ? ', incl
 The server is already configured for this game: setup is finished and the setup API is closed, so don't try to change server settings. Build against this configuration:
 ${JSON.stringify(cfg, null, 2)}
 
-Integrate the SDK following MULTIPLAYER.md using these room types and servers. If a server setting should change, tell me what and why; I'll change it in the dashboard.`;
+Integrate the SDK following MULTIPLAYER.md using these room types and servers. Public servers in the list above are always online and anyone can join them with mp.joinServer('<id>') (mp.servers.list() lists them with player counts). If the game needs an always-online lobby (a public lobby / hub / open world anyone can join, e.g. up to 400 players) and there isn't one above, tell me: I'll add it in the dashboard (Servers → "Always-online lobby"), and you join it with mp.joinServer('lobby'). If any other server setting should change, tell me what and why; I'll change it in the dashboard.`;
   }
   return head + `
 
 Do this in order (send every setup call with header "Authorization: Bearer <setup key>"):
 1. Read the game's code and work out what it needs: genre, session type (match / lobby / persistent / open-world), average and peak concurrent players, players per room, whether players move (2d/3d) and their position fields, world size or view distance, how often each client should send updates (sendRate, Hz), server tick rate if rules run on the server, the round-trip latency it feels good at (latencyTarget, ms), whether cheating matters, regions, and the data it syncs (player data, room state, storage, messages).
+   Also decide whether the game needs an ALWAYS-ONLINE LOBBY: a public lobby / hub / open world that is always running and anyone can join at any time (for example up to 400 players). If so, put "lobby": {"maxPlayers": 400, "name": "Lobby"} in the profile (step 4 then creates it as public server "lobby" with interest management sized for that many players), or create it directly with PUT ${SERVER}/api/setup/servers/lobby {"name": "Lobby", "maxPlayers": 400, "queue": true, "options": {"aoi": {"radius": <view distance>, "keys": ["x", "y"]}, "persist": true}}. Players join it with mp.joinServer('lobby').
 2. POST ${SERVER}/api/setup/messages {"text": "..."} to tell me in the dashboard what you found and what you plan. Use this chat throughout: for real questions, post the question, then GET ${SERVER}/api/setup/messages?after=<last id>&wait=60 (repeat) until I reply. Don't block on questions you can answer sensibly yourself.
 3. GET ${SERVER}/api/setup to see the current setup, the schema and live metrics.
 4. POST ${SERVER}/api/setup/recommend with {"profile": {...}}. Review the recommended setup, estimates and notes, and adjust anything that doesn't fit this game (room types, max players, interest radius, servers, leaderboards, storage rules, remote config, server script).
@@ -304,6 +305,9 @@ module.exports = {
     // e.g. timers, regen, AI, physics. room.data is server-only scratch space.
   },
 };`;
+// An always-online public lobby / hub anyone can join (mp.joinServer('lobby')). Set aoi.radius to the game's view distance.
+const LOBBY_TEMPLATE = { id: 'lobby', name: 'Lobby', description: 'Always-online lobby: anyone can join', maxPlayers: 400,
+  visibility: 'public', queue: true, motd: 'Welcome!', options: { aoi: { radius: 150, keys: ['x', 'y'] }, persist: true } };
 const SERVER_TEMPLATE = { id: 'eu-1', name: 'EU #1', description: '', region: 'eu', tags: ['pvp'], maxPlayers: 200,
   visibility: 'public', password: null, queue: true, motd: 'Welcome!', options: { aoi: { radius: 150, keys: ['x', 'y'] }, persist: true } };
 async function renderDetail() {
@@ -387,7 +391,7 @@ async function renderDetail() {
         <span class="sp"></span><button class="sm" data-sedit="${esc(x.id)}">Edit</button><button class="sm danger" data-sdel="${esc(x.id)}">Delete</button></div>`).join('') : '<div class="empty">No public servers yet. They are permanent rooms players pick from a server list (mp.servers.list / mp.joinServer).</div>'}
       <div class="mute" style="margin:14px 0 6px" id="srvTitle">New server (JSON)</div>
       <textarea id="srvCfg" spellcheck="false" style="height:200px;font:12.5px/1.45 var(--mono)">${esc(JSON.stringify(SERVER_TEMPLATE, null, 2))}</textarea>
-      <div class="row" style="margin-top:6px"><span class="mute">Fields: id, name, description, region, tags, maxPlayers, password, visibility (public | unlisted), whitelist, queue, motd, type, options (any room option, e.g. aoi), enabled.</span><span class="sp"></span><button class="sm" id="srvNew">Clear</button><button class="sm primary" id="srvSave">Create server</button></div></div>`;
+      <div class="row" style="margin-top:6px"><span class="mute">Fields: id, name, description, region, tags, maxPlayers, password, visibility (public | unlisted), whitelist, queue, motd, type, options (any room option, e.g. aoi), enabled.</span><span class="sp"></span><button class="sm" id="srvLobby">Always-online lobby (400)</button><button class="sm" id="srvNew">Clear</button><button class="sm primary" id="srvSave">Create server</button></div></div>`;
   if (detailTab === 'storage') {
     const sum = await api('GET', `/games/${g.id}/kv/summary`);
     const total = Object.values(sum).reduce((a, x) => a + x.keys, 0);
@@ -551,6 +555,7 @@ async function renderDetail() {
     let editing = null;
     const reset = () => { editing = null; $('#srvTitle').textContent = 'New server (JSON)'; $('#srvSave').textContent = 'Create server'; $('#srvCfg').value = JSON.stringify(SERVER_TEMPLATE, null, 2); };
     $('#srvNew').onclick = reset;
+    $('#srvLobby').onclick = () => { reset(); $('#srvCfg').value = JSON.stringify(LOBBY_TEMPLATE, null, 2); $('#srvCfg').focus(); };
     document.querySelectorAll('[data-sedit]').forEach((b) => b.onclick = async () => {
       const x = await api('GET', `/games/${g.id}/servers/${encodeURIComponent(b.dataset.sedit)}`);
       editing = x.id; $('#srvTitle').textContent = 'Edit server ' + x.id; $('#srvSave').textContent = 'Save changes';
