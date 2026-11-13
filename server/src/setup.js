@@ -28,6 +28,7 @@ export const SCHEMA = {
     viewDistance: 'how far a player can see in game units (becomes aoi.radius)',
     competitive: 'boolean: cheating matters (server-authoritative data and leaderboards)',
     regions: "array of region names for public servers, e.g. ['au', 'us']",
+    lobby: '{ maxPlayers: 400, name: "Lobby" } (or true): an always-online public lobby / hub / open world anyone can join with mp.joinServer("lobby"). On by default for sessionType "lobby"; false turns it off',
     dataModel: '{ player: {field: type}, state: {...}, storage: {...}, messages: {...} }: documentation of the data the game syncs',
     notes: 'string',
   },
@@ -50,6 +51,14 @@ export function createSetup(d) {
   const num = (v, lo, hi) => (v == null || v === '' || !Number.isFinite(+v) ? null : Math.max(lo, Math.min(hi, +v)));
   const strs = (v, n, len) => (Array.isArray(v) ? v.slice(0, n).map((x) => str(String(x), len, '')).filter(Boolean) : []);
 
+  // Always-online lobby: true -> 400 players; sessionType 'lobby' gets one unless lobby: false.
+  function normLobby(l, sessionType) {
+    if (l === false) return null;
+    if (l == null) l = sessionType === 'lobby' ? true : null;
+    if (!l) return null;
+    const o = isObj(l) ? l : {};
+    return { maxPlayers: num(o.maxPlayers, 2, 5000) || 400, name: str(o.name, 64, '') || 'Lobby' };
+  }
   function normProfile(p = {}) {
     if (!isObj(p)) throw new E('bad_profile', 'profile must be an object');
     const pl = isObj(p.players) ? p.players : {};
@@ -65,6 +74,7 @@ export function createSetup(d) {
       positionKeys: keys && keys.length >= 2 ? keys : null,
       worldSize: num(p.worldSize, 0, 1e9), viewDistance: num(p.viewDistance, 0, 1e9),
       competitive: !!p.competitive, regions: strs(p.regions, 20, 32),
+      lobby: normLobby(p.lobby, p.sessionType),
       dataModel: dm, notes: str(p.notes, 2000, ''),
     };
   }
@@ -109,7 +119,7 @@ export function createSetup(d) {
     const rateLimit = Math.max(60, Math.ceil(sendRate * 2 + 20 + (p.tickRate ? 10 : 0)));
     const setup = {
       profile: { ...p, sendRate, players: { ...p.players, perRoom: per } },
-      limits: { maxRoomPlayers: Math.max(per, 16), defaultMaxPlayers: per, rateLimit, rateBurst: rateLimit * 3,
+      limits: { maxRoomPlayers: Math.max(per, 16, p.lobby ? p.lobby.maxPlayers : 0), defaultMaxPlayers: per, rateLimit, rateBurst: rateLimit * 3,
         reconnectGraceMs: persistent ? 60000 : p.sessionType === 'match' ? 20000 : 15000 },
       roomTypes, requireRoomType: true,
       storage: { playerDataWrite: p.competitive ? 'none' : 'all', gameDataWrite: 'none' },
@@ -124,6 +134,19 @@ export function createSetup(d) {
         setup.servers.push({ id: `${r}-${i}`.toLowerCase().replace(/[^a-z0-9_-]/g, '-'), name: `${r.toUpperCase()} #${i}`, region: r, maxPlayers: per, type: typeName, queue: true });
       }
       notes.push(`${setup.servers.length} public server(s) for a peak of ${peak} players at ${per} per server.`);
+    }
+    if (p.lobby) {
+      // One permanent public server everyone lands in: never closes, keeps its state, queue when full.
+      const n = p.lobby.maxPlayers, keys = p.positionKeys || (p.movement === '3d' ? ['x', 'y', 'z'] : ['x', 'y']);
+      const options = { persist: true };
+      if (p.movement !== 'none') {
+        const radius = p.viewDistance || (p.worldSize ? Math.round(p.worldSize * Math.sqrt(TARGET_VISIBLE / (Math.PI * n))) : null);
+        options.aoi = { radius: radius || 100, keys };
+        if (!radius) notes.push('Lobby aoi.radius is a placeholder (100): set it to the view distance in world units.');
+      } else if (n > 32) notes.push(`Lobby of ${n} without positions: every player update reaches everyone, so keep per-player updates rare.`);
+      (setup.servers = setup.servers || []).unshift({ id: 'lobby', name: p.lobby.name, description: 'Always-online lobby: anyone can join',
+        maxPlayers: n, queue: true, options });
+      notes.push(`Always-online lobby "${p.lobby.name}" (server id "lobby", up to ${n} players${options.aoi ? ', interest management on' : ''}): players join with mp.joinServer('lobby'); it never closes and keeps its state.`);
     }
     if (p.competitive) notes.push('Competitive: players can read but not write their own storage (playerDataWrite none) and boards should use clientWrite:false. Put rules, scoring and rewards in the server script.');
     if (p.latencyTarget && p.latencyTarget < 80) notes.push(`Latency target ${p.latencyTarget} ms: host the server in the players' region, send movement with setPlayer(..., {unreliable: true}), and use prediction (mp.predict).`);
@@ -181,7 +204,7 @@ export function createSetup(d) {
         if (!isObj(s) || typeof s.id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(s.id)) throw new E('bad_setup', `servers[${i}].id: [A-Za-z0-9_-]{1,64} required`);
         if (s.type && !Object.hasOwn(types, s.type)) throw new E('bad_setup', `servers[${i}].type "${s.type}" is not a room type`);
         if (s.options !== undefined) validateRoomOptions(s.options, `servers[${i}].options`);
-        servers.validate(g, s, i);
+        servers.validate({ ...g, settings: { ...g.settings, ...out.settings } }, s, i); // limits from this same document count
         return s;
       });
       out.replaceServers = !!doc.replaceServers;

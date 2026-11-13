@@ -538,6 +538,25 @@ try {
     assert.equal(te.value, 2); assert.ok(te.expires > Date.now() && te.version === 2); ok('storage browser: editing a value keeps its expiry');
     assert.equal((await api('GET', '/overview')).body.players.find((x) => x.id === pl.playerId).sdk, Multiplayer.VERSION); ok('dashboard shows each player\'s SDK version');
     pl.disconnect();
+    // always-online lobby
+    const recL = (await api('POST', `/games/${game.id}/setup/recommend`, { profile: { sessionType: 'match', players: { perRoom: 8 }, movement: '2d', viewDistance: 300, lobby: { maxPlayers: 400 } } })).body;
+    const lob = recL.setup.servers[0];
+    assert.deepEqual([lob.id, lob.maxPlayers, lob.options.aoi.radius, lob.options.persist], ['lobby', 400, 300, true]);
+    assert.ok(recL.setup.limits.maxRoomPlayers >= 400 && recL.notes.some((x) => /Always-online lobby/.test(x)));
+    assert.equal((await api('POST', `/games/${game.id}/setup/recommend`, { profile: { sessionType: 'lobby' } })).body.setup.servers[0].maxPlayers, 400);
+    assert.equal((await api('POST', `/games/${game.id}/setup/recommend`, { profile: { sessionType: 'lobby', lobby: false } })).body.setup.servers, undefined);
+    ok('lobby: recommend adds an always-online 400-player lobby (profile.lobby or sessionType lobby)');
+    await api('PUT', `/games/${game.id}/setup`, { limits: { maxRoomPlayers: 16 } });
+    const lobApplied = await api('PUT', `/games/${game.id}/setup`, recL.setup);
+    assert.equal(lobApplied.status, 200); assert.ok(lobApplied.body.servers.created.includes('lobby')); ok('setup: a server is checked against the limits in the same document');
+    const lp = [];
+    for (const n of ['L1', 'L2', 'L3']) { const x = new Multiplayer({ url: BASE, key: game.key, name: n, transports: ['websocket'] }); await x.connect(); await x.joinServer('lobby', { playerData: { x: 0, y: 0 } }); lp.push(x); }
+    assert.equal(lp[0].room.maxPlayers, 400); assert.equal(lp[0].room.aoi.radius, 300);
+    await waitFor(() => lp[0].players.size === 3);
+    for (const x of lp) await x.leave();
+    const after = (await lp[0].servers.list()).find((x) => x.id === 'lobby');
+    assert.deepEqual([after.players, after.maxPlayers], [0, 400]); ok('lobby: anyone joins with joinServer, it stays online when everyone leaves');
+    for (const x of lp) x.disconnect();
     // back to an open configuration for the remaining tests
     await api('PUT', `/games/${game.id}/setup`, { requireRoomType: false, roomTypes: {}, limits: {}, storage: { playerDataWrite: 'all', gameDataWrite: 'all' }, lockLeaderboards: false, script: '', servers: [], replaceServers: true });
     cl.disconnect();

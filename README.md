@@ -2,6 +2,7 @@
 
 A self-hosted, game-agnostic multiplayer backend. One Docker stack on your VPS gives you:
 
+- **Always-online lobby**: one click in the dashboard (or `"lobby": {"maxPlayers": 400}` in the setup profile) creates a permanent public lobby / hub / open world that anyone can join at any time with `mp.joinServer('lobby')`.
 - **Public servers and open worlds**: a server browser of permanent, admin-defined servers (name, region, tags, MOTD, password, whitelist, join queue, saved state), rooms of up to 5000 players, and interest management so each player only receives the players near them (1000 players in one room measured with a 0 ms median ping).
 - **Setup API for coding agents**: each game has a secret setup key. The dashboard's integration prompt tells Claude to work out the game's needs, call `POST /api/setup/recommend` with a profile (players, update rate, latency target, data model) and apply the result with `PUT /api/setup`: room types, limits, servers, leaderboards, storage rules and the server script. The game's **Setup** tab then shows the expected numbers next to the measured ones (average and peak players, players per room, update rate, tick, ping, traffic).
 - **Customisable per game**: limits (room size, room count, rate limits, reconnect grace), named room types that clients can't override, room defaults, and anything else via server scripts. All of it is edited in the dashboard.

@@ -44,6 +44,7 @@ All calls take `Authorization: Bearer SETUP_KEY` and JSON bodies:
   "tickRate": 10,                          // Hz server-script onTick (0 = none)
   "latencyTarget": 100,                    // ms round trip that feels good
   "competitive": true, "regions": ["au"],
+  "lobby": { "maxPlayers": 400, "name": "Lobby" },   // optional: an always-online lobby anyone can join (see "Always-online lobby")
   "dataModel": { "player": { "x": "number", "y": "number", "hp": "number" }, "state": { "buildings": "map" }, "storage": { "inventory": "private" } }
 } }
 ```
@@ -230,6 +231,20 @@ Server config (admin): `id, name, description, region, tags, maxPlayers, passwor
 - `enabled`
 
 Changing `maxPlayers`, the password or the whitelist applies live, and raising `maxPlayers` lets queued players in. A server runs your server script like any other room, so `onCreate`, `onTick` and the rest work for persistent worlds. State is saved every 30 s and on shutdown.
+
+### Always-online lobby (anyone can join, any time)
+For a shared lobby, hub, town or small open world that's always running, with up to hundreds of players dropping in and out, use one public server, conventionally with the id `lobby`:
+- **Setup API:** add `"lobby": {"maxPlayers": 400}` to the profile and the recommendation creates it. Or create it directly:
+  `PUT SERVER_URL/api/setup/servers/lobby {"name": "Lobby", "maxPlayers": 400, "queue": true, "options": {"aoi": {"radius": 150, "keys": ["x", "y"]}, "persist": true}}`
+- **Dashboard:** Game → Servers → **Always-online lobby (400)**, then Create server.
+```js
+await mp.connect();
+const lobby = await mp.joinServer('lobby', { playerData: { x: spawn.x, y: spawn.y } }); // waits in the queue if it's ever full
+mp.setPlayer({ x, y }, { unreliable: true });   // movement; aoi keeps 400 players cheap
+mp.on('playerJoined', addAvatar); mp.on('playerLeft', removeAvatar);
+// from the lobby, start a match:  await mp.matchmake('duel', { size: 2 })  or  await mp.create({ type: 'match' })
+```
+The lobby never closes, even with nobody in it, and its room state is saved, so put persistent lobby things like decorations or a notice board in `room.state`. Players don't get host powers there. The server script's `onJoin` / `onTick` run for it like any room. Anything above about 32 players needs `aoi` with the players' positions; set `aoi.radius` to the view distance.
 
 ### Open worlds: interest management (`aoi`)
 In a normal room every update goes to everyone, so cost grows with players². With `aoi`, each player only receives the players within `radius` of them:
